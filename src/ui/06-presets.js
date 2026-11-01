@@ -32,6 +32,7 @@ function definePresets() {
   }));
 
   factory('FREEZE BLOOM', 'AMBIENT', P_({
+    'main.gain': 5, 
     'stretch.on': 1, 'stretch.speed': 6, 'stretch.tempo': '1/1', 'stretch.grain': '1/32', 'stretch.spread': 85, 'stretch.scatter': 25, 'stretch.mix': 100,
     ...fxp('halo', { size: 80, decay: 75, shimmer: 45 }), 'fx.halo.mix': 55,
     ...fxp('multifilter', { cutoff: 2400, res: 25 }),

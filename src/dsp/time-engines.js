@@ -32,6 +32,24 @@ class TE_Ring {
   }
 }
 
+// Step remover for discrete switches (mode / order changes): the jump between the last
+// output sample and the first new one is added back as an offset that decays in ~2.5 ms.
+class TE_Declick {
+  constructor(sr) { this.k = Math.exp(-1 / (0.0025 * sr)); this.dl = 0; this.dr = 0; this.lastL = 0; this.lastR = 0; this.armed = false; }
+  arm() { this.armed = true; }
+  run(L, R, n) {
+    if (this.armed) { this.armed = false; this.dl += this.lastL - L[0]; this.dr += this.lastR - R[0]; }
+    let dl = this.dl, dr = this.dr;
+    if (dl !== 0 || dr !== 0) {
+      const k = this.k;
+      for (let i = 0; i < n; i++) { L[i] += dl; R[i] += dr; dl *= k; dr *= k; }
+      if (Math.abs(dl) < 1e-6 && Math.abs(dr) < 1e-6) { dl = 0; dr = 0; }
+      this.dl = dl; this.dr = dr;
+    }
+    this.lastL = L[n - 1]; this.lastR = R[n - 1];
+  }
+}
+
 // Linear ON/OFF + mix helper shared by the engines
 class TE_Fader {
   constructor(sr) { this.v = 0; this.step = 1 / (0.01 * sr); }
@@ -114,6 +132,9 @@ class Varispeed {
         wl = wl * g + tmp[0] * (1 - g); wr = wr * g + tmp[1] * (1 - g);
         this.xf += this.xfStep; if (this.xf > 1) this.xf = 1;
       }
+      // a (nearly) stopped tape is silent: a frozen read head would otherwise hold a DC level
+      const ar = r < 0 ? -r : r;
+      if (ar < 0.125) { const lv = ar * 8; wl *= lv; wr *= lv; }
       // saturation
       if (sat > 0.001) {
         if (crush) {
@@ -149,19 +170,24 @@ class Stutter {
     this.fader = new TE_Fader(sr);
     this.rng = new Rng(0xC0FFEE);
     this.envD = new EnvFollower(sr, 3, 150); this.envW = new EnvFollower(sr, 3, 150);
+    this.dk = new TE_Declick(sr);
     this.reset();
   }
   reset() {
     this.ring.clear(); this.ring.w = 0;
     this.cycle = null; this.active = false; this.act = 0;
-    // voice A (current) and B (fading)
-    this.va = { pos: 0, rate: 1, gain: 1, panL: 1, panR: 1, live: true, on: false };
-    this.vb = { pos: 0, rate: 1, gain: 1, panL: 1, panR: 1, live: false, on: false };
+    // STUTTER: a small voice pool with nested crossfades (a new rep may start while older ones
+    // still fade out: the current voice fades in with weight vf, all others share 1 - vf).
+    // BENDIT uses va (current) + vb (fading) with xf.
+    this.pool = [];
+    for (let i = 0; i < 6; i++) this.pool.push({ pos: 0, rate: 1, gain: 1, panL: 1, panR: 1, live: false, on: false, env: 1, w0: 0, g0: 1 });
+    this.va = this.pool[0]; this.va.live = true; this.vf = 1; this.vfStep = 0.01; this.smoothN = 384;
+    this.vb = { pos: 0, rate: 1, gain: 1, panL: 1, panR: 1, live: false, on: false, env: 1, w0: 0, g0: 1 };
     this.xf = 1; this.xfStep = 0.01;
     this.k = 0; this.t = 0; this.repLen = 1; this.sliceStart = 0; this.sliceLen = 1; this.repContent = 1;
     this.wasOn = false; this.seqStep = -1; this.seqIdx = 0; this.wasBend = false; this.histW = 0;
     // bendit
-    this.b = { liveUntil: 0, cycle: null, capStart: 0, T: 1, sub: -1, subLen: 1, j: 0, rate: 1, rateT: 1, dir: 1, drop: false, t: 0, zoneW: 0, zoneB: 0, scratch: 0, beat: null, anchor: 0, depth: 1, srate: 1, captured: false, gate: 1 };
+    this.b = { liveUntil: 0, cycle: null, capStart: 0, T: 1, sub: -1, subLen: 1, j: 0, rate: 1, rateT: 1, dir: 1, drop: false, t: 0, zoneW: 0, zoneB: 0, scratch: 0, beat: null, anchor: 0, depth: 1, srate: 1, captured: false, gate: 1, live: false, reps: 0, tPrev: 0 };
     this.state = { active: 0, k: 0, ph: 0 };
   }
   _repLen(k, base, pattern) {
@@ -174,11 +200,33 @@ class Stutter {
       default: return base;
     }
   }
+  // take a pool voice for a new rep: the current voice keeps its weight vf, older voices are
+  // scaled by (1 - vf); with no voice free, the quietest one is reused.
+  _newVoice() {
+    const cur = this.va, vf = this.vf, pool = this.pool;
+    let free = null, weakest = null;
+    for (let i = 0; i < pool.length; i++) {
+      const v = pool[i];
+      if (!v.on) { if (!free) free = v; continue; }
+      if (v === cur) { v.w0 = vf; v.g0 = v.gain * v.env; }
+      else {
+        v.w0 *= 1 - vf;
+        if (v.w0 < 1e-4) { v.on = false; if (!free) free = v; continue; }
+      }
+      if (!weakest || v.w0 < weakest.w0) weakest = v;
+    }
+    const nv = free || weakest;
+    nv.on = true; nv.env = 1; nv.w0 = 0;
+    this.va = nv; this.vf = 0;
+    // SMOOTH, but no longer than two repeats: short repeats with a long SMOOTH would otherwise
+    // stack more fading voices than the pool holds
+    this.vfStep = 1 / Math.max(16, Math.min(this.smoothN, 2 * this.repLen));
+    return nv;
+  }
+  _voicesOff(keep) { const pool = this.pool; for (let i = 0; i < pool.length; i++) if (pool[i] !== keep) pool[i].on = false; }
   _startRep(p, live) {
-    // move current voice to fading slot, start a new voice for rep k
-    const va = this.va, vb = this.vb;
-    vb.pos = va.pos; vb.rate = va.rate; vb.gain = va.gain * (va.env === undefined ? 1 : va.env); vb.panL = va.panL; vb.panR = va.panR; vb.live = va.live; vb.on = va.on;
-    this.xf = 0;
+    // the current voice starts fading out, a new voice plays rep k
+    const va = this._newVoice();
     const k = this.k;
     let semis = p.pitch + p.ramp * k; semis = clamp(semis, -36, 36);
     let ratio = semisToRatio(semis);
@@ -209,10 +257,11 @@ class Stutter {
     while (rem >= this.repLen && this.k < 4096) { rem -= this.repLen; this.k++; this.repLen = this._repLen(this.k, this.sliceLen, p.pattern); }
     this.t = rem;
     this.active = true;
+    const prevOn = this.va.on;
     this._startRep(p, this.k === 0);
     if (this.k > 0) { this.va.pos += this.va.rate * rem; }
     // coming from dry, the act envelope fades in; from an active cycle, crossfade the voices
-    if (this.act <= 0 || !this.vb.on) this.xf = 1;
+    if (this.act <= 0 || !prevOn) { this.vf = 1; this._voicesOff(this.va); }
   }
   _gateEnv(u, g, curve) {
     if (g <= 0.001) return 1;
@@ -233,22 +282,35 @@ class Stutter {
     if (!on && this.fader.v === 0) {
       for (let i = 0; i < n; i++) ring.push(L[i], R[i]);
       this.wasOn = false; this.active = false; this.act = 0; this.cycle = null; this.b.cycle = null; this.b.captured = false;
+      this.dk.dl = this.dk.dr = 0; this.dk.armed = false;
       this.state.active = 0; return;
     }
     const justOn = on && !this.wasOn; this.wasOn = on;
-    if (p.bend >= 0.5) {
+    const bend = p.bend >= 0.5;
+    if (bend !== this.wasBend && !justOn) this.dk.arm(); // STUTTER <-> BENDIT while audible: remove the step
+    if (bend) {
       const enter = !this.wasBend; this.wasBend = true;
-      return this._processBend(L, R, n, p, bp, seq, ctx, justOn || enter);
+      this._processBend(L, R, n, p, bp, seq, ctx, justOn || enter);
+    } else {
+      if (this.wasBend) { this.wasBend = false; this.cycle = null; this.vf = 1; this._voicesOff(this.va); }
+      this._processStutter(L, R, n, p, seq, ctx, justOn);
     }
-    if (this.wasBend) { this.wasBend = false; this.cycle = null; }
-    const sr = this.sr, spb = ctx.spb, tmp = this.tmp, va = this.va, vb = this.vb;
+    this.dk.run(L, R, n);
+  }
+  _wrapVoice(delta) { // the current voice fades out where it is, a copy continues delta samples away
+    const old = this.va, v = this._newVoice();
+    v.pos = old.pos + delta; v.rate = old.rate; v.gain = old.gain; v.env = old.env; v.panL = old.panL; v.panR = old.panR; v.live = false;
+  }
+  _processStutter(L, R, n, p, seq, ctx, justOn) {
+    const on = p.on >= 0.5, ring = this.ring;
+    const sr = this.sr, spb = ctx.spb, tmp = this.tmp, pool = this.pool;
     const mix = p.mix / 100;
     let rateBeats = p.rate, capBeats = p.capture;
     if (p.link >= 0.5) { const lp = LINK_PRESETS[p.lpreset | 0] || LINK_PRESETS[4]; rateBeats = DIV_BEATS[lp[0]]; capBeats = DIV_BEATS[lp[1]]; }
     const useSeq = p.seq >= 0.5 && seq;
     this._seqDriven = useSeq;
     const smoothN = Math.max(16, p.smooth * sr / 1000);
-    this.xfStep = 1 / smoothN;
+    this.smoothN = smoothN; this.xfStep = 1 / smoothN;
     const actStep = 1 / smoothN;
     const gate = p.gate / 100, gcurve = p.gcurve | 0, prob = p.prob / 100, retrig = p.retrig / 100;
     for (let i = 0; i < n; i++) {
@@ -293,24 +355,35 @@ class Stutter {
       }
       // --- render voices ---
       let wl = dl, wr = dr;
+      const va = this.va;
       if (va.on) {
         this._readVoice(va, tmp);
-        const env = this.active ? this._gateEnv(this.t / this.repLen, gate, gcurve) : (va.env === undefined ? 1 : va.env);
+        const env = this.active ? this._gateEnv(this.t / this.repLen, gate, gcurve) : va.env;
         va.env = env;
-        let g = va.gain * env;
+        const vf = this.vf, g = va.gain * env * vf;
         wl = tmp[0] * g * va.panL; wr = tmp[1] * g * va.panR;
-        if (this.xf < 1) {
-          this._readVoice(vb, tmp);
-          const gb = vb.gain * (1 - this.xf), ga = this.xf;
-          wl = wl * ga + tmp[0] * gb * vb.panL; wr = wr * ga + tmp[1] * gb * vb.panR;
-          vb.pos += vb.rate; this.xf += this.xfStep;
+        if (vf < 1) { // older reps fading out
+          const rest = 1 - vf;
+          for (let j = 0; j < pool.length; j++) {
+            const v = pool[j];
+            if (!v.on || v === va) continue;
+            this._readVoice(v, tmp);
+            const gv = v.g0 * v.w0 * rest;
+            wl += tmp[0] * gv * v.panL; wr += tmp[1] * gv * v.panR;
+            v.pos += v.rate;
+            if (!v.live && v.pos > ring.w - 4) { v.pos = ring.w - 4; v.rate = 0; } // a fading voice that catches up holds still
+          }
+          this.vf = vf + this.vfStep;
+          if (this.vf >= 1) { this.vf = 1; this._voicesOff(va); }
         }
         va.pos += va.rate;
+        // pitched-up repeats outrun the recording: jump back (crossfaded) instead of reading the future
+        if (!va.live && va.rate > 1 && va.pos > ring.w - 4) this._wrapVoice(-Math.max(this.repContent, va.rate * 64));
       }
       if (this.active) this.t++;
       // dry ↔ stutter crossfade (linear)
       if (this.active) { this.act += actStep; if (this.act > 1) this.act = 1; }
-      else { this.act -= actStep; if (this.act <= 0) { this.act = 0; va.on = false; } }
+      else { this.act -= actStep; if (this.act <= 0) { this.act = 0; this.va.on = false; this._voicesOff(null); } }
       wl = dl + (wl - dl) * this.act; wr = dr + (wr - dr) * this.act;
       const f = this.fader.next(on ? 1 : 0) * mix;
       L[i] = dl + (wl - dl) * f; R[i] = dr + (wr - dr) * f;
@@ -347,6 +420,8 @@ class Stutter {
       if (st.on) reps = 1 + Math.round(st.v * 31);
     }
     const subLen = T / reps;
+    // a new REPS (knob, modulation or sequencer step) or TIME re-grids the sub-sections mid-window
+    if (reps !== b.reps || Math.abs(T - b.tPrev) > T * 0.01) { if (b.reps > 0 && !justOn) this.dk.arm(); b.reps = reps; b.tPrev = T; }
     const alpha = Math.max(0.04, bp.window / 100);
     const width = bp.width, duck = bp.duck / 100;
     const slewMs = zw === 4 ? 60 : zw === 5 ? 3 : 12;
@@ -423,25 +498,34 @@ class Stutter {
       if (zw !== 5) { b.rate += (b.rateT - b.rate) * slewC; va.rate = b.rate; }
       // render
       let wl, wr;
-      if (now < b.liveUntil) { // live first pass while the loop is being recorded
-        const f0 = this.fader.next(p.on >= 0.5 ? 1 : 0); void f0;
-        L[i] = dl; R[i] = dr; va.pos = b.capStart + (now - b.capStart); continue;
-      }
-      // keep reads inside the captured loop
-      va.pos = this._wrapLoop(va.pos, b.capStart, b.T);
-      ring.read(ring.safe(va.pos), tmp);
       const u = zw === 5 ? 0.5 : (tc - si * subLen) / subLen;
       const win = zw === 5 ? 1 : tukey(clamp(u, 0, 1), alpha);
       const g = (b.drop ? 0 : 1) * win * b.gate;
-      wl = tmp[0] * g; wr = tmp[1] * g;
-      if (this.xf < 1) {
-        vb.pos = this._wrapLoop(vb.pos, b.capStart, b.T);
-        ring.read(ring.safe(vb.pos), tmp);
-        const gb = (1 - this.xf) * vb.gain;
-        wl = wl * this.xf + tmp[0] * gb; wr = wr * this.xf + tmp[1] * gb;
-        vb.pos += vb.rate; this.xf += this.xfStep;
+      if (now < b.liveUntil) {
+        // live first pass while the loop is being recorded, shaped like the loop it becomes
+        wl = dl * g; wr = dr * g; va.pos = now; b.live = true;
+      } else {
+        if (b.live) { // the live pass ends: crossfade from the input into the loop
+          b.live = false;
+          vb.pos = now - 3; vb.rate = 1; vb.gain = g; vb.on = true; this.xf = 0;
+          va.pos = this._wrapLoop(now, b.capStart, b.T);
+        }
+        // keep reads inside the captured loop; the wrap is crossfaded (vb carries on past the seam)
+        const x = va.pos - b.capStart;
+        if (x >= b.T || x < 0) {
+          if (this.xf >= 1) { this._swapVoice(); vb.gain = g; va.pos = this._wrapLoop(va.pos, b.capStart, b.T); }
+          else if (x >= b.T + 4 * xfN || x < -4 * xfN) va.pos = this._wrapLoop(va.pos, b.capStart, b.T);
+        }
+        ring.read(ring.safe(va.pos), tmp);
+        wl = tmp[0] * g; wr = tmp[1] * g;
+        if (this.xf < 1) {
+          ring.read(ring.safe(vb.pos), tmp);
+          const gb = (1 - this.xf) * vb.gain;
+          wl = wl * this.xf + tmp[0] * gb; wr = wr * this.xf + tmp[1] * gb;
+          vb.pos += vb.rate; this.xf += this.xfStep;
+        }
+        va.pos += va.rate;
       }
-      va.pos += va.rate;
       // width (mid/side)
       if (width !== 1) {
         const m = (wl + wr) * 0.5, s = (wl - wr) * 0.5 * width;

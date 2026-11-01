@@ -28,6 +28,9 @@ registerFX(class extends FX {
   static cat = 'DISTORTION';        // category (see list below)
   static desc = 'Bitcrusher with sample-rate reduction and odd converter models.'; // one sentence
   static latency = 0;               // samples of added latency (FFT effects: N of the STFT)
+  // optional, for a latency that changes at run time (e.g. a SIZE param): set this.latency in the
+  // instance (≤ maxLatency) and the host's dry compensation follows it (crossfaded)
+  static maxLatency = 0;
   static params = [ /* descriptors, ≤ 12, see below */ ];
 
   init() { /* allocate buffers; this.sr is the sample rate */ }

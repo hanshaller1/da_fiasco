@@ -5,9 +5,10 @@
 //
 // Every effect runs on the shared lib STFT (Hann analysis + synthesis,
 // overlap 4, latency N). Effects with a SIZE param pad smaller FFT sizes up to
-// their static latency so the host's dry compensation stays aligned (4K adds
-// N - latency extra samples). Everything lives inside one IIFE; helper names
-// carry an SPX_ prefix for readability only.
+// their static latency; a 4K size raises the latency to N, which every instance
+// reports in this.latency (static maxLatency = 4096) so the host's dry
+// compensation follows. Everything lives inside one IIFE; helper names carry an
+// SPX_ prefix for readability only.
 // ============================================================================
 (() => {
   'use strict';
@@ -88,6 +89,7 @@
   // frame-time → ppq, stereo-linked auto gain.
   // ==========================================================================
   class SPX_Base extends FX {
+    static maxLatency = 4096; // SIZE 4K; this.latency holds the current value
     init() {
       const C = this.constructor;
       this.L = C.latency | 0;
@@ -106,6 +108,8 @@
       this.agcG = 1; this._Ei = 0; this._Eo = 0; this._ei = 0; this._eo = 0;
       this.agcT = [0.25, 0.25, 0.03, 0]; // energy averaging, gain-up, gain-down times (s); [3]=1: fast-rise envelopes
       this.setup();
+      // every FFT size is built here, so changing SIZE never allocates inside the audio callback
+      if (C.hasSize) for (let k = 0; k < 4; k++) { const M = 512 << k; if (!this._slots[M]) { const s = this._slots[M] = { stft: new STFT(M, 4), st: null }; s.st = this.alloc(M); } }
       this._use(this.L);
     }
     setup() {}
@@ -115,6 +119,7 @@
     frame() {}
     _use(N) {
       this.N = N; this.B = N / 2 + 1; this.hop = N / 4;
+      this.latency = Math.max(this.L, N);
       let s = this._slots[N];
       if (!s) { s = this._slots[N] = { stft: new STFT(N, 4), st: null }; s.st = this.alloc(N); }
       this.stft = s.stft; this.st = s.st;

@@ -3,7 +3,7 @@
 // demo loop synthesis, file loading, print/resample.
 // ============================================================================
 
-const AUDIO = { ctx: null, node: null, analyser: null, mode: '', micNode: null, started: false, loops: {}, current: null };
+const AUDIO = { ctx: null, node: null, analyser: null, mode: '', micNode: null, micStream: null, started: false, starting: null, loops: {}, current: null };
 
 const DEMO_LOOPS = [
   { id: 'break', name: 'BREAK', bpm: 96, bars: 2, desc: 'Dusty breakbeat with a round bass' },
@@ -12,8 +12,14 @@ const DEMO_LOOPS = [
   { id: 'choir', name: 'CHOIR', bpm: 70, bars: 2, desc: 'Breathy vowel pad, slowly opening' },
 ];
 
+// Concurrent callers (a quick double click on PLAY, a demo button while PLAY is still starting)
+// share one start-up instead of each creating an AudioContext and an engine.
 async function startAudio() {
   if (AUDIO.started) { if (AUDIO.ctx.state !== 'running') await AUDIO.ctx.resume(); return true; }
+  if (!AUDIO.starting) AUDIO.starting = bootAudio().catch((err) => { console.warn(err); toast('Audio could not start in this browser.'); return false; }).then((ok) => { AUDIO.starting = null; return ok; });
+  return AUDIO.starting;
+}
+async function bootAudio() {
   const Ctx = window.AudioContext || window.webkitAudioContext;
   if (!Ctx) { toast('This browser has no Web Audio support.'); return false; }
   const ctx = new Ctx({ latencyHint: 'interactive' });
@@ -140,10 +146,16 @@ function synthLoop(id, sr) {
 async function loadDemo(id, silentToast) {
   AUDIO.current = id;
   for (const b of $$('.src-btn')) b.classList.toggle('on', b.dataset.src === id);
-  if (!AUDIO.started) return;
+  if (!AUDIO.started) { previewDemo(id); return; }
   let lp = AUDIO.loops[id];
   if (!lp) { lp = synthLoop(id, AUDIO.ctx.sampleRate); AUDIO.loops[id] = lp; }
   setSource(lp, silentToast);
+}
+// before audio starts: show the loop (and its tempo) that PLAY will start
+function previewDemo(id) {
+  const lp = synthLoop(id, 48000);
+  drawWaveform(lp); $('#src-name').textContent = lp.name;
+  S.bpm = lp.bpm; const inp = $('#bpm'); if (inp) inp.value = String(lp.bpm);
 }
 function setSource(lp, silentToast) {
   const L = lp.L.slice(), R = lp.R.slice();
@@ -182,11 +194,16 @@ async function loadFile(file) {
 
 async function toggleMic() {
   const ok = await startAudio(); if (!ok) return;
-  if (AUDIO.micNode) { AUDIO.micNode.disconnect(); AUDIO.micNode = null; AUDIO.srcMode = 0; post({ type: 'srcmode', mode: 0 }); $('#mic-btn').classList.remove('on'); return; }
+  if (AUDIO.micNode) {
+    AUDIO.micNode.disconnect(); AUDIO.micNode = null;
+    if (AUDIO.micStream) { for (const t of AUDIO.micStream.getTracks()) t.stop(); AUDIO.micStream = null; } // releases the microphone
+    AUDIO.srcMode = 0; post({ type: 'srcmode', mode: 0 }); $('#mic-btn').classList.remove('on'); $('#mic-btn').setAttribute('aria-pressed', 'false'); return;
+  }
   try {
     const stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false } });
+    AUDIO.micStream = stream;
     AUDIO.micNode = AUDIO.ctx.createMediaStreamSource(stream); AUDIO.micNode.connect(AUDIO.node);
-    AUDIO.srcMode = 1; post({ type: 'srcmode', mode: 1 }); $('#mic-btn').classList.add('on');
+    AUDIO.srcMode = 1; post({ type: 'srcmode', mode: 1 }); $('#mic-btn').classList.add('on'); $('#mic-btn').setAttribute('aria-pressed', 'true');
     toast('Live input on. Use headphones to avoid feedback.');
   } catch (e) { toast('Live input is not available here. Load an audio file instead.'); }
 }

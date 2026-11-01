@@ -84,7 +84,7 @@ function GraphPanel(g) {
   const p = Panel('GRAPH ' + g, { id: 'src-' + src, cls: 'graphcol', tools: [
     h('button', { type: 'button', class: 'icon-btn', title: 'Reset curve', 'aria-label': 'Reset curve', onclick: () => { S.graphs[g - 1] = DSP.DEFAULT_GRAPHS[g - 1].map((q) => ({ ...q })); graphSend(g - 1); } }, '↺'),
     DiceBtn('Random curve', () => { const n = 2 + Math.floor(Math.random() * 6); const pts = []; for (let i = 0; i < n; i++) pts.push({ x: i === 0 ? 0 : Math.random(), y: Math.random(), c: (Math.random() * 2 - 1) * 0.8 }); pts.sort((a, b) => a.x - b.x); S.graphs[g - 1] = pts; graphSend(g - 1); })] });
-  const cv = h('canvas', { class: 'graph-cv', width: 520, height: 150, tabindex: 0, 'aria-label': `Graph ${g} curve editor. Click to add a point, drag to move, right-click to delete.` });
+  const cv = h('canvas', { class: 'graph-cv', width: 520, height: 150, tabindex: 0, 'aria-label': `Graph ${g} curve editor. Click to add a point, drag to move, right-click or double-click a point to delete.` });
   const ed = { cv, g: g - 1, drag: null };
   graphEditors.push(ed);
   const toXY = (e) => { const r = cv.getBoundingClientRect(); return [(e.clientX - r.left) / r.width, 1 - (e.clientY - r.top) / r.height]; };
@@ -99,8 +99,10 @@ function GraphPanel(g) {
       let seg = pts.length - 1; for (let k = 0; k < pts.length; k++) if (pts[k].x <= x) seg = k;
       const cy = DSP.evalGraph(pts, x);
       if (Math.abs(cy - y) * cv.getBoundingClientRect().height < 10 && !e.shiftKey && e.detail < 2) { ed.drag = { bend: seg, y0: e.clientY, c0: pts[seg].c || 0 }; return; }
-      pts.push({ x, y, c: 0 }); pts.sort((a, b) => a.x - b.x); i = pts.findIndex((q) => q.x === x && q.y === y);
-    }
+      const nx = Math.max(0, Math.min(0.999, x)), ny = clampN(y);
+      pts.push({ x: nx, y: ny, c: 0 }); pts.sort((a, b) => a.x - b.x); i = pts.findIndex((q) => q.x === nx && q.y === ny);
+      ed.added = pts[i]; // a double click that adds a point must not delete it again
+    } else if (e.detail < 2) ed.added = null;
     ed.drag = { i, pt: pts[i] }; graphSend(ed.g);
   });
   cv.addEventListener('pointermove', (e) => {
@@ -113,8 +115,10 @@ function GraphPanel(g) {
   const end = () => { ed.drag = null; };
   cv.addEventListener('pointerup', end); cv.addEventListener('pointercancel', end);
   cv.addEventListener('contextmenu', (e) => e.preventDefault());
+  // double-click / double-tap on a point deletes it (touch screens have no right click)
+  cv.addEventListener('dblclick', (e) => { const [x, y] = toXY(e), pts = S.graphs[ed.g], i = hit(x, y); if (i >= 0 && pts.length > 2 && pts[i] !== ed.added) { pts.splice(i, 1); ed.drag = null; graphSend(ed.g); } ed.added = null; });
   p.body.append(cv, h('div', { class: 'kgrid' }, Knob(u + '.len'), Segment(u + '.dir', { labels: ['FWD', 'REV', 'PING'] }), Select(u + '.speed')),
-    h('p', { class: 'muted small' }, 'Click to add a point · drag the line to bend it · right-click a point to delete'),
+    h('p', { class: 'muted small' }, 'Click to add a point · drag the line to bend it · right-click or double-click a point to delete'),
     SlotList(src, true));
   return p.el;
 }
@@ -239,12 +243,14 @@ function buildPerform(root) {
   const cv = h('canvas', { width: 420, height: 420, 'aria-hidden': 'true' });
   pad.append(cv);
   const trail = [];
-  const setXY = (e) => { const r = pad.getBoundingClientRect(); const x = clampN((e.clientX - r.left) / r.width), y = clampN(1 - (e.clientY - r.top) / r.height); setP('perform.x', x); setP('perform.y', y); setInfo('PAD', `X ${Math.round(x * 100)}% · Y ${Math.round(y * 100)}%`); };
+  const padText = () => { const t = `X ${Math.round(P['perform.x'] * 100)}% · Y ${Math.round(P['perform.y'] * 100)}%`; pad.setAttribute('aria-valuetext', t); return t; };
+  const setXY = (e) => { const r = pad.getBoundingClientRect(); const x = clampN((e.clientX - r.left) / r.width), y = clampN(1 - (e.clientY - r.top) / r.height); setP('perform.x', x); setP('perform.y', y); setInfo('PAD', padText()); };
   let dn = false;
   pad.addEventListener('pointerdown', (e) => { e.preventDefault(); dn = true; pad.setPointerCapture(e.pointerId); setXY(e); });
   pad.addEventListener('pointermove', (e) => { if (dn) setXY(e); });
   pad.addEventListener('pointerup', () => { dn = false; }); pad.addEventListener('pointercancel', () => { dn = false; });
-  pad.addEventListener('keydown', (e) => { const st = 0.03; let x = P['perform.x'], y = P['perform.y']; if (e.key === 'ArrowLeft') x -= st; else if (e.key === 'ArrowRight') x += st; else if (e.key === 'ArrowUp') y += st; else if (e.key === 'ArrowDown') y -= st; else return; e.preventDefault(); setP('perform.x', x); setP('perform.y', y); });
+  pad.addEventListener('keydown', (e) => { const st = 0.03; let x = P['perform.x'], y = P['perform.y']; if (e.key === 'ArrowLeft') x -= st; else if (e.key === 'ArrowRight') x += st; else if (e.key === 'ArrowUp') y += st; else if (e.key === 'ArrowDown') y -= st; else return; e.preventDefault(); setP('perform.x', x); setP('perform.y', y); setInfo('PAD', padText()); });
+  onKey('perform.x', padText); onKey('perform.y', padText);
   padDraw = () => {
     if (!cv.isConnected || cv.offsetParent === null) return;
     const c = cv.getContext('2d'), W = cv.width, H = cv.height;

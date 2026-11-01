@@ -2,9 +2,15 @@
 // DEBACLE UI — TIME and FX pages
 // ============================================================================
 
-const changeHooks = new Map(); // key -> [fn]
-function onKey(key, fn) { if (!changeHooks.has(key)) changeHooks.set(key, []); changeHooks.get(key).push(fn); fn(); }
-on('change', (k) => { const l = changeHooks.get(k); if (l) for (const fn of l) fn(); });
+const changeHooks = new Map(); // key -> [{ fn, owner }]
+// owner: element the hook belongs to; once it has left the page the hook is dropped
+// (FX cards are rebuilt on every chain edit)
+function onKey(key, fn, owner) { if (!changeHooks.has(key)) changeHooks.set(key, []); changeHooks.get(key).push({ fn, owner }); fn(); }
+function runKeyHooks(k) {
+  const l = changeHooks.get(k); if (!l) return;
+  for (let i = 0; i < l.length; i++) { const hk = l[i]; if (hk.owner && !hk.owner.isConnected) { l.splice(i--, 1); continue; } hk.fn(); }
+}
+on('change', runKeyHooks);
 
 function unitKeys(prefix) { return Object.keys(DEFS).filter((k) => k.startsWith(prefix + '.')); }
 function diceKeys(keys, amount = 1) {
@@ -185,14 +191,18 @@ function buildFx(root) {
   });
   const main = h('div', { class: 'fx-main' }, toolbar, empty, chainEl);
   root.append(h('div', { class: 'fx-layout' }, lib, main));
+  const chainInfo = () => {
+    const on = S.chain.filter((id) => P['fx.' + id + '.on'] >= 0.5), fft = on.filter((id) => FXMETA[id].latency).length;
+    $('#chain-info').textContent = S.chain.length ? `${S.chain.length} in chain · ${on.length} on${fft ? ` · ${fft} FFT (adds latency)` : ''}` : '';
+  };
   const renderChain = () => {
     chainEl.innerHTML = '';
     empty.hidden = S.chain.length > 0;
     for (const id of S.chain) chainEl.append(FxCard(id));
-    const lat = S.chain.reduce((a, id) => a + (P['fx.' + id + '.on'] >= 0.5 ? FXMETA[id].latency : 0), 0);
-    $('#chain-info').textContent = S.chain.length ? `${S.chain.length} in chain${lat ? ` · +${lat} samples FFT latency` : ''}` : '';
+    chainInfo();
   };
   on('chain', renderChain);
+  on('change', (k) => { if (k.startsWith('fx.') && k.endsWith('.on')) chainInfo(); });
   renderLib(); renderChain();
 }
 function clearChainConfirm() {
@@ -261,11 +271,11 @@ function FxCard(id) {
         else if (d.kind === 'num' && freeIds.includes(d.id) && keys.some((q) => DEFS[q].d.kind === 'div')) own[i].hidden = on;
       });
     };
-    onKey(syncKey, upd);
+    onKey(syncKey, upd, own[0]);
   }
   const body = h('div', { class: 'fx-body' }, h('div', { class: 'kgrid' }, ...own), h('div', { class: 'fx-host' }, Knob('fx.' + id + '.mix'), Knob('fx.' + id + '.gain')));
   const card = h('article', { class: 'fx-card', id: 'fx-' + id, style: { '--cat': `var(--c-${m.cat.toLowerCase()})` } }, head, h('p', { class: 'fx-desc' }, m.desc), body);
-  onKey('fx.' + id + '.on', () => card.classList.toggle('is-off', P['fx.' + id + '.on'] < 0.5));
+  onKey('fx.' + id + '.on', () => card.classList.toggle('is-off', P['fx.' + id + '.on'] < 0.5), card);
   return card;
 }
 on('tick', (t) => {

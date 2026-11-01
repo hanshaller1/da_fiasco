@@ -1477,7 +1477,9 @@ registerFX(class extends FX {
   }
   process(L, R, n, p, ctx) {
     const P = this.prm;
-    P[0] = p.size; P[1] = clamp(p.division | 0, 2, 32); P[2] = p.shuffle * 0.01; P[3] = p.repeat * 0.01; P[4] = p.pitch * 0.01;
+    // two banks (recording + playing) must fit the 20 s ring: at very slow tempi halve SIZE
+    let B = p.size; while (B * ctx.spb > this.N * 0.5 - 4096 && B > 1 / 64) B *= 0.5;
+    P[0] = B; P[1] = clamp(p.division | 0, 2, 32); P[2] = p.shuffle * 0.01; P[3] = p.repeat * 0.01; P[4] = p.pitch * 0.01;
     P[5] = p.reverse * 0.01; P[6] = p.gate * 0.01; P[7] = p.ratchet * 0.01; P[8] = p.fade * 0.001 * this.sr;
     P[9] = ctx.ppq; P[10] = ctx.spb;
     this._dsp(L, R, n);
@@ -1485,7 +1487,7 @@ registerFX(class extends FX {
   _dsp(L, R, n) {
     const P = this.prm, S = this.S, bL = this.bL, bR = this.bR, mask = this.mask, N = this.N;
     const B = P[0], D = P[1], fadeS = P[8], ppq = P[9], spb = P[10];
-    const bankLen = Math.min(B * spb, N * 0.5 - 4096), sliceB = B / D, fadeC = 1 - Math.exp(-2.5 / Math.max(8, fadeS));
+    const bankLen = B * spb, sliceB = B / D, fadeC = 1 - Math.exp(-2.5 / Math.max(8, fadeS));
     let t = this.t;
     for (let i = 0; i < n; i++) {
       bL[t & mask] = L[i]; bR[t & mask] = R[i];
@@ -1577,7 +1579,9 @@ registerFX(class extends FX {
   }
   process(L, R, n, p, ctx) {
     const P = this.prm;
-    P[0] = p.span; P[1] = clamp(p.cuts | 0, 1, 32); P[2] = p.slip * 0.01; P[3] = p.seek; P[4] = p.wear * 0.01;
+    // a replay window must fit the 20 s ring twice: at very slow tempi halve SPAN
+    let span = p.span; while (span * ctx.spb > (this.N - 8192) * 0.5 && span > 1 / 128) span *= 0.5;
+    P[0] = span; P[1] = clamp(p.cuts | 0, 1, 32); P[2] = p.slip * 0.01; P[3] = p.seek; P[4] = p.wear * 0.01;
     P[5] = 0.02 + 0.98 * p.edge * 0.01; P[6] = p.width * 0.01; P[7] = ctx.ppq; P[9] = ctx.spb;
     this._dsp(L, R, n);
   }

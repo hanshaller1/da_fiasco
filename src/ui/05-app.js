@@ -8,17 +8,49 @@ function snapshot() {
   for (const [k, n] of Object.entries(P)) if (Math.abs(n - DEFS[k].d.defN) > 1e-6) p[k] = +n.toFixed(5);
   return { v: 1, p, chain: S.chain.slice(), slots: S.slots.map((x) => ({ ...x })), graphs: S.graphs.map((g) => g.map((q) => ({ ...q }))), seq: JSON.parse(JSON.stringify(S.seq)), dice: { ...S.dice } };
 }
+// Presets come from storage, the clipboard or files: rebuild every part with sane types so a
+// damaged preset cannot leave NaN parameters or a sequencer / graph the engine cannot read.
+const finiteOr = (x, d) => { x = +x; return Number.isFinite(x) ? x : d; };
+function cleanSlots(list) {
+  const out = [], seen = new Set(), count = {};
+  for (const x of Array.isArray(list) ? list : []) {
+    if (!x || !DEFS[x.target] || !SRC_INFO[x.src] || seen.has(x.src + '>' + x.target)) continue;
+    if ((count[x.src] = (count[x.src] || 0) + 1) > SLOT_CAP(x.src)) continue;
+    seen.add(x.src + '>' + x.target);
+    out.push({ src: x.src, target: x.target, min: clampN(finiteOr(x.min, 0)), max: clampN(finiteOr(x.max, 1)), start: clampN(finiteOr(x.start, 0)), end: clampN(finiteOr(x.end, 1)),
+      skew: Math.max(-1, Math.min(1, finiteOr(x.skew, 0))), shape: Math.max(0, Math.min(2, finiteOr(x.shape, 0) | 0)) });
+  }
+  return out;
+}
+function cleanGraphs(g) {
+  return DSP.DEFAULT_GRAPHS.map((def, i) => {
+    const src = Array.isArray(g) && Array.isArray(g[i]) ? g[i] : [];
+    const pts = src.filter((q) => q && Number.isFinite(+q.x) && Number.isFinite(+q.y))
+      .map((q) => ({ x: Math.max(0, Math.min(0.999, +q.x)), y: clampN(+q.y), c: Math.max(-1, Math.min(1, finiteOr(q.c, 0))) })).sort((a, b) => a.x - b.x);
+    return pts.length >= 2 ? pts : def.map((q) => ({ ...q }));
+  });
+}
+function cleanSeq(seq) {
+  const out = {};
+  for (const w of ['stutter', 'stretch']) {
+    const src = seq && Array.isArray(seq[w]) ? seq[w] : [];
+    out[w] = DSP.defaultSeq(w).map((pat, p) => pat.map((d, k) => { const st = Array.isArray(src[p]) ? src[p][k] : null; return st ? { on: st.on ? 1 : 0, v: clampN(finiteOr(st.v, 0.5)) } : d; }));
+  }
+  return out;
+}
 function applyState(st) {
+  st = st && typeof st === 'object' ? st : {};
   for (const k of Object.keys(P)) P[k] = DEFS[k].d.defN;
-  for (const [k, n] of Object.entries(st.p || {})) if (k in P) P[k] = clampN(+n);
-  S.chain = (st.chain || []).filter((id) => FXMETA[id]);
-  S.slots = (st.slots || []).filter((x) => DEFS[x.target] && SRC_INFO[x.src]).map((x) => ({ start: 0, end: 1, skew: 0, shape: 0, ...x }));
-  S.graphs = st.graphs ? st.graphs.map((g) => g.map((q) => ({ ...q }))) : DSP.DEFAULT_GRAPHS.map((g) => g.map((q) => ({ ...q })));
-  S.seq = st.seq ? JSON.parse(JSON.stringify(st.seq)) : { stutter: DSP.defaultSeq('stutter'), stretch: DSP.defaultSeq('stretch') };
-  S.dice = { ...(st.dice || {}) };
+  for (const [k, n] of Object.entries(st.p || {})) if (k in P && Number.isFinite(+n)) P[k] = clampN(+n);
+  S.chain = [...new Set((Array.isArray(st.chain) ? st.chain : []).filter((id) => FXMETA[id]))];
+  S.slots = cleanSlots(st.slots);
+  S.graphs = cleanGraphs(st.graphs);
+  S.seq = cleanSeq(st.seq);
+  S.dice = {};
+  for (const [k, v] of Object.entries(st.dice || {})) if (DEFS[k] && Number.isFinite(+v)) S.dice[k] = clampN(+v);
   if (AUDIO.started) sendAll();
   refreshAllWidgets();
-  for (const k of Object.keys(P)) { const l = changeHooks.get(k); if (l) for (const fn of l) fn(); }
+  for (const k of Object.keys(P)) runKeyHooks(k);
   emit('chain'); emit('slots');
   for (const v of seqViews) v.el && v.el.isConnected && v.el.dispatchEvent(new Event('refresh'));
 }
@@ -78,7 +110,7 @@ function presetMenu(anchor) {
   items.push({ label: 'Save as user preset…', act: () => savePresetDialog() });
   items.push({ label: 'Copy preset to clipboard', act: () => copyPreset() });
   items.push({ label: 'Import preset (paste or file)…', act: () => importDialog() });
-  if (list[presetIdx] && list[presetIdx].user) items.push({ label: 'Delete “' + list[presetIdx].name + '”', danger: true, act: () => { const u = userPresets(); const k = presetIdx - FACTORY.length; u.splice(k, 1); saveUserPresets(u); toast('Preset deleted.'); presetIdx = 0; } });
+  if (list[presetIdx] && list[presetIdx].user) items.push({ label: 'Delete “' + list[presetIdx].name + '”', danger: true, act: () => { const u = userPresets(); const k = presetIdx - FACTORY.length; u.splice(k, 1); saveUserPresets(u); toast('Preset deleted.'); presetIdx = 0; dirty = true; updatePresetLabel(); } });
   menu(items, r.left, r.bottom + 4, { title: 'PRESETS', cols: list.length > 18 ? 2 : 1 });
 }
 function dialog(title, bodyNodes, actions) {
@@ -141,7 +173,7 @@ function buildHeader() {
   $('#print-btn').addEventListener('click', printLoop);
   $('#play').addEventListener('click', () => togglePlay());
   const bpm = $('#bpm');
-  bpm.addEventListener('change', () => { const v = parseFloat(bpm.value); if (v > 0) setBpm(v); else bpm.value = S.bpm; });
+  bpm.addEventListener('change', () => { const v = parseFloat(bpm.value); if (v > 0) setBpm(v); bpm.value = (Math.round(S.bpm * 10) / 10).toString(); });
   $('#tap').addEventListener('click', tapTempo);
   // key
   $('#keybox').append(Select('key.root', { label: 'ROOT' }), Select('key.scale', { label: 'SCALE' }), Select('key.chord', { label: 'CHORD' }), Select('key.csize', { label: 'VOICING' }));
@@ -309,8 +341,8 @@ function boot() {
   loadPreset(first >= 0 ? first : 0);
   let page = 'time'; try { page = localStorage.getItem('debacle.page') || 'time'; } catch (e) { /* ignore */ }
   showPage(['time', 'fx', 'animate', 'perform'].includes(page) ? page : 'time');
-  // preview the default demo loop waveform before audio starts
-  const sr = 48000; const lp = synthLoop('break', sr); AUDIO.loops.break = null; drawWaveform(lp); $('#src-name').textContent = lp.name;
+  // preview the loop PLAY will start (loadPreset already did if the preset names one)
+  if (!AUDIO.current) { AUDIO.current = 'break'; previewDemo('break'); }
   requestAnimationFrame(frame);
 }
 document.readyState === 'loading' ? document.addEventListener('DOMContentLoaded', boot) : boot();

@@ -12,7 +12,7 @@ const DSP = { UNITS, FX_REGISTRY, HOST_FX_PARAMS, DebacleEngine, prepParam, norm
 
 const $ = (sel, el = document) => el.querySelector(sel);
 const $$ = (sel, el = document) => [...el.querySelectorAll(sel)];
-const clampN = (x) => (x < 0 ? 0 : x > 1 ? 1 : x);
+const clampN = (x) => (x > 0 ? (x > 1 ? 1 : x) : 0); // NaN -> 0
 function h(tag, attrs, ...kids) {
   const el = document.createElement(tag);
   if (attrs) for (const [k, v] of Object.entries(attrs)) {
@@ -164,7 +164,7 @@ function attachParamHover(el, key) {
 function attachContext(el, key) {
   el.addEventListener('contextmenu', (e) => { e.preventDefault(); paramMenu(key, e.clientX, e.clientY); });
   let lp = 0, sx = 0, sy = 0;
-  el.addEventListener('pointerdown', (e) => { if (e.pointerType !== 'touch') return; sx = e.clientX; sy = e.clientY; lp = setTimeout(() => { lp = 0; el.dataset.lp = '1'; paramMenu(key, sx, sy); }, 550); });
+  el.addEventListener('pointerdown', (e) => { delete el.dataset.lp; if (e.pointerType !== 'touch') return; sx = e.clientX; sy = e.clientY; lp = setTimeout(() => { lp = 0; el.dataset.lp = '1'; paramMenu(key, sx, sy); }, 550); });
   const cancel = (e) => { if (lp && (!e || Math.hypot(e.clientX - sx, e.clientY - sy) > 8 || e.type !== 'pointermove')) { clearTimeout(lp); lp = 0; } };
   el.addEventListener('pointermove', cancel); el.addEventListener('pointerup', cancel); el.addEventListener('pointercancel', cancel);
 }
@@ -184,7 +184,7 @@ function Knob(key, opts = {}) {
   const label = h('div', { class: 'k-label' + (labText.length > 9 ? ' long' : '') }, labText);
   const value = h('div', { class: 'k-value' });
   const badge = h('div', { class: 'k-badge' });
-  const el = h('div', { class: 'knob' + (opts.big ? ' big' : '') + (d.bipolar ? ' bipolar' : ''), tabindex: 0, role: 'slider', 'aria-label': keyLabel(key) }, badge, svg, value, label);
+  const el = h('div', { class: 'knob' + (opts.big ? ' big' : '') + (d.bipolar ? ' bipolar' : ''), tabindex: 0, role: 'slider', 'aria-label': keyLabel(key), 'aria-valuemin': 0, 'aria-valuemax': 100 }, badge, svg, value, label);
   const w = {
     el,
     update() {
@@ -202,7 +202,7 @@ function Knob(key, opts = {}) {
       } else { modr.setAttribute('d', ''); badge.textContent = ''; }
       dot.style.display = sl.length ? '' : 'none';
       value.textContent = fmt(key, sl.length && live.mods[key] !== undefined ? live.mods[key] : n);
-      el.setAttribute('aria-valuetext', value.textContent);
+      el.setAttribute('aria-valuetext', value.textContent); el.setAttribute('aria-valuenow', Math.round(n * 100));
     },
     live(nm) { // modulated live value
       const [x, y] = polar(cx, cy, r + 3.5, n2deg(nm)); dot.setAttribute('cx', x); dot.setAttribute('cy', y);
@@ -225,7 +225,7 @@ function Knob(key, opts = {}) {
     el.classList.add('drag');
   });
   el.addEventListener('pointermove', (e) => {
-    if (!drag) return;
+    if (!drag || el.dataset.lp) return; // long-press opened the menu: the finger no longer drags
     const dy = (drag.y - e.clientY) + (e.clientX - drag.x) * 0.35;
     if (Math.abs(dy) > 2) drag.moved = true;
     const sens = (e.shiftKey ? 900 : 180) * (opts.big ? 1.4 : 1);
@@ -240,7 +240,7 @@ function Knob(key, opts = {}) {
     if (discrete) { const steps = d.options.length - 1; n = Math.round(clampN(n) * steps) / steps; }
     if (n !== P[key]) { setP(key, n); setInfo(keyLabel(key), fmt(key)); }
   });
-  const end = () => { if (drag) { drag = null; el.classList.remove('drag'); clearInfoSoon(); } };
+  const end = () => { if (drag) { drag = null; el.classList.remove('drag'); clearInfoSoon(); } delete el.dataset.lp; };
   el.addEventListener('pointerup', end); el.addEventListener('pointercancel', end);
   el.addEventListener('dblclick', () => { setP(key, d.defN); setInfo(keyLabel(key), fmt(key)); });
   el.addEventListener('wheel', (e) => {
@@ -297,7 +297,7 @@ function Segment(key, opts = {}) {
   const el = h('div', { class: 'seg' + (opts.cls ? ' ' + opts.cls : ''), role: 'radiogroup', 'aria-label': keyLabel(key) });
   const btns = labels.map((lab, i) => {
     const b = h('button', { type: 'button', role: 'radio', 'aria-checked': 'false' }, lab);
-    b.addEventListener('click', () => { engineAutoOn(key); setP(key, d.options.length > 1 ? i / (d.options.length - 1) : 0); setInfo(keyLabel(key), fmt(key)); });
+    b.addEventListener('click', () => { if (el.dataset.lp) { delete el.dataset.lp; return; } engineAutoOn(key); setP(key, d.options.length > 1 ? i / (d.options.length - 1) : 0); setInfo(keyLabel(key), fmt(key)); });
     el.append(b); return b;
   });
   const w = { el, update() { const idx = Math.round(P[key] * (d.options.length - 1)); btns.forEach((b, i) => { b.classList.toggle('on', i === idx); b.setAttribute('aria-checked', i === idx ? 'true' : 'false'); }); el.classList.toggle('modded', slotsFor(key).length > 0); } };
@@ -314,6 +314,7 @@ function Select(key, opts = {}) {
   const w = { el, update() { val.textContent = fmt(key); el.classList.toggle('modded', slotsFor(key).length > 0); } };
   regWidget(key, w); w.update();
   el.addEventListener('click', () => {
+    if (el.dataset.lp) { delete el.dataset.lp; return; }
     const r = el.getBoundingClientRect();
     const items = d.options.map((o, i) => ({ label: o, checked: Math.round(P[key] * (d.options.length - 1)) === i, act: () => { engineAutoOn(key); setP(key, i / (d.options.length - 1)); } }));
     menu(items, r.left, r.bottom + 4, { title: opts.label || d.label, cols: d.options.length > 12 ? 2 : 1 });
@@ -464,9 +465,9 @@ function SlotRow(slot, opts = {}) {
     c.stroke();
   };
   const field = (prop, label, lo, hi, fmtf) => {
-    const f = h('div', { class: 'slot-f', tabindex: 0, role: 'slider', 'aria-label': label },
+    const f = h('div', { class: 'slot-f', tabindex: 0, role: 'slider', 'aria-label': label, 'aria-valuemin': lo, 'aria-valuemax': hi },
       h('span', { class: 'slot-fl' }, label), h('span', { class: 'slot-fv' }));
-    const upd = () => { f.querySelector('.slot-fv').textContent = fmtf(slot[prop]); };
+    const upd = () => { const t = fmtf(slot[prop]); f.querySelector('.slot-fv').textContent = t; f.setAttribute('aria-valuenow', +slot[prop].toFixed(3)); f.setAttribute('aria-valuetext', t); };
     let dr = null;
     f.addEventListener('pointerdown', (e) => { e.preventDefault(); f.setPointerCapture(e.pointerId); dr = { y: e.clientY, x: e.clientX, v: slot[prop] }; });
     f.addEventListener('pointermove', (e) => { if (!dr) return; const dv = ((dr.y - e.clientY) + (e.clientX - dr.x) * 0.5) / (e.shiftKey ? 800 : 160) * (hi - lo); slot[prop] = Math.max(lo, Math.min(hi, dr.v + dv)); upd(); draw(); slotChanged(slot); });

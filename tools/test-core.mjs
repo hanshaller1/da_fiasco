@@ -45,3 +45,63 @@ eng.handle({ type: 'print', len: SR * 2 });
 run('print', 5, []);
 console.log('ticks', msgs.filter((m) => m.type === 'tick').length, 'printed', msgs.some((m) => m.type === 'printed'));
 const last = msgs.filter((m) => m.type === 'tick').pop(); console.log(JSON.stringify(last).slice(0, 400));
+
+// ---- regression checks (fail the run) ------------------------------------------------------
+let fails = 0;
+const check = (label, ok, info = '') => { if (!ok) fails++; console.log((ok ? 'ok  ' : 'FAIL') + ' ' + label.padEnd(34), info); };
+const hasFx = (id) => !!eng.fx[id];
+// steps in the output (second difference), sine source that does not fit the loop
+function clicks(sr, setup, events, secs = 6) {
+  const e = new E(sr, () => {}); const n = sr * 4, S = new Float32Array(n);
+  for (let i = 0; i < n; i++) S[i] = 0.3 * Math.sin(2 * Math.PI * 97.37 * i / sr);
+  e.handle({ type: 'source', L: S, R: S.slice() }); e.handle({ type: 'play', on: true });
+  for (const m of setup) e.handle(m);
+  const o = [new Float32Array(128), new Float32Array(128)]; let p1 = 0, p2 = 0, worst = 0, bad = false;
+  for (let b = 0; b < secs * sr / 128; b++) {
+    for (const [at, msgs] of events) if (at === b) for (const m of msgs) e.handle(m);
+    e.process(null, null, o[0], o[1], 128);
+    for (let i = 0; i < 128; i++) { const x = o[0][i]; if (!Number.isFinite(x)) bad = true; if (b > 30) worst = Math.max(worst, Math.abs(x - 2 * p1 + p2)); p2 = p1; p1 = x; }
+  }
+  return { worst, bad, eng: e };
+}
+const Pm = (k, n) => ({ type: 'param', k, n }), blk = (s) => Math.round(s * SR / 128);
+if (hasFx('smear') && hasFx('eq') && hasFx('clip')) {
+  let r = clicks(SR, [{ type: 'chain', ids: ['smear'] }, Pm('fx.smear.on', 1), Pm('fx.smear.mix', 0.5)], [[blk(2.1), [Pm('fx.smear.on', 0)]], [blk(4.1), [Pm('fx.smear.on', 1)]]]);
+  check('fft fx on/off (serial, mix 50)', r.worst < 0.02, 'worst step ' + r.worst.toFixed(3));
+  r = clicks(SR, [{ type: 'chain', ids: ['smear'] }, Pm('fx.smear.on', 1)], [[blk(2.1), [Pm('fx.smear.on', 0)]]]);
+  check('fft fx off (serial, mix 100)', r.worst < 0.02, 'worst step ' + r.worst.toFixed(3));
+  r = clicks(SR, [{ type: 'chain', ids: ['eq', 'clip', 'smear'] }, Pm('chain.mode', 1), Pm('fx.eq.on', 1)], [[blk(1.6), [Pm('fx.clip.on', 1)]], [blk(3.1), [Pm('fx.smear.on', 1)]], [blk(4.6), [Pm('fx.eq.on', 0)]]]);
+  check('parallel chain toggles + fft', r.worst < 0.05 && !r.bad, 'worst step ' + r.worst.toFixed(3));
+  r = clicks(SR, [{ type: 'chain', ids: ['smear'] }, Pm('main.mix', 0.5)], [[blk(2.1), [Pm('fx.smear.on', 1)]], [blk(4.1), [Pm('fx.smear.on', 0)]]]);
+  check('main mix 50 + fft latency change', r.worst < 0.02, 'worst step ' + r.worst.toFixed(3));
+  r = clicks(SR, [{ type: 'chain', ids: ['eq', 'smear', 'clip'] }, Pm('fx.eq.on', 1), Pm('fx.smear.on', 1), Pm('fx.clip.on', 1)], [[blk(2.1), [Pm('chain.mode', 1)]], [blk(3.6), [Pm('chain.mode', 0)]], [blk(5.1), [Pm('chain.mode', 1)]]], 7);
+  check('serial <-> parallel with fft on', r.worst < 0.02, 'worst step ' + r.worst.toFixed(3));
+  r = clicks(SR, [{ type: 'chain', ids: ['eq', 'clip', 'chorus'] }, Pm('fx.eq.on', 1), Pm('fx.clip.on', 1), Pm('fx.chorus.on', 1)], [[blk(2.1), [{ type: 'chain', ids: ['clip', 'chorus', 'eq'] }]], [blk(3.6), [{ type: 'chain', ids: ['chorus', 'eq'] }]], [blk(5.1), [{ type: 'chain', ids: ['chorus', 'eq', 'clip'] }]]], 7);
+  check('reorder / remove / add while on', r.worst < 0.02, 'worst step ' + r.worst.toFixed(3));
+  r = clicks(SR, [{ type: 'chain', ids: ['smear'] }, Pm('fx.smear.on', 1), Pm('fx.smear.mix', 0.5)], [[blk(2.1), [Pm('fx.smear.size', 1)]]]);
+  check('fft size 4K: latency follows', r.eng.fx.smear.lat() === 4096 && r.worst < 0.02, 'latency ' + r.eng.fx.smear.lat() + ', worst step ' + r.worst.toFixed(3));
+}
+{ // malformed messages must not poison the engine
+  const r = clicks(SR, [Pm('stutter.on', 1), Pm('stutter.seq', 1), Pm('sseq.chain', 1), Pm('vari.speed', NaN), { type: 'bpm', bpm: NaN },
+    { type: 'seq', which: 'stutter', pats: [[{ on: 1 }]] }, { type: 'graph', i: 0, points: [{ x: 'a' }] }, { type: 'source', L: new Float32Array(0) },
+    { type: 'slots', slots: [{ src: 'lfo1', target: 'vari.wow', min: 'x', max: null }, { src: 'nope', target: 'main.gain' }] }], []);
+  check('malformed messages', !r.bad && r.eng.ctx.spb > 0, 'finite output, bpm ' + r.eng.ctx.bpm);
+}
+{ // the beat clock follows tempo changes without jumping; stop continues from the play position
+  const e = new E(SR, () => {}); e.handle({ type: 'play', on: true });
+  const o = [new Float32Array(128), new Float32Array(128)]; let prev = 0, maxJump = 0;
+  for (let b = 0; b < 3000; b++) {
+    if (b === 1000) e.handle({ type: 'bpm', bpm: 300 }); if (b === 1500) e.handle({ type: 'bpm', bpm: 30 }); if (b === 2000) e.handle({ type: 'play', on: false });
+    e.process(null, null, o[0], o[1], 128);
+    if (b > 0) maxJump = Math.max(maxJump, Math.abs(e.ctx.ppq - prev)); prev = e.ctx.ppq;
+  }
+  check('ppq continuous (bpm 30/300, stop)', maxJump < 128 / (SR * 60 / 300) + 1e-6, 'max step ' + maxJump.toFixed(4) + ' beats/block');
+}
+for (const sr of [44100, 96000]) { // everything on at other sample rates and extreme tempi
+  for (const bpm of [30, 300]) {
+    const r = clicks(sr, [{ type: 'bpm', bpm }, Pm('vari.on', 1), Pm('stutter.on', 1), Pm('stretch.on', 1), Pm('bend.warp', 0.6), Pm('time.order', 1)], [[Math.round(1.5 * sr / 128), [Pm('stutter.bend', 1)]]], 3);
+    check(`engines @${sr} Hz, ${bpm} bpm`, !r.bad && r.worst < 0.05, 'worst step ' + r.worst.toFixed(3));
+  }
+}
+console.log(fails ? fails + ' regression checks failing' : 'regression checks ok');
+process.exit(fails ? 1 : 0);

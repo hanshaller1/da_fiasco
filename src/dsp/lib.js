@@ -261,6 +261,7 @@ class STFT {
     this.outF = [new Float32Array(size), new Float32Array(size)];
     this.acc = [new Float32Array(size * 2), new Float32Array(size * 2)];
     this.re = new Float32Array(size); this.im = new Float32Array(size);
+    this.cre = [new Float32Array(size), new Float32Array(size)]; this.cim = [new Float32Array(size), new Float32Array(size)];
     this.rover = this._lat;
     this.frameCount = 0;
   }
@@ -284,7 +285,6 @@ class STFT {
   _frame(frame) {
     const N = this.N, H = N >> 1, hop = this.hop, m = N - 1, re = this.re, im = this.im, w = this.win;
     const inL = this.inF[0], inR = this.inF[1];
-    if (!this.cre) { this.cre = [new Float32Array(N), new Float32Array(N)]; this.cim = [new Float32Array(N), new Float32Array(N)]; }
     const lr = this.cre[0], li = this.cim[0], rr = this.cre[1], ri = this.cim[1];
     for (let k = 0; k < N; k++) { re[k] = inL[k] * w[k]; im[k] = inR[k] * w[k]; }
     this.fft.forward(re, im);
