@@ -150,6 +150,23 @@
     }
   }
 
+  // Click-free stage count (phaser stages, swirl sections, disperse amount): the count glides at most
+  // `rate` stages per block and never crosses an integer inside a block. Per block the kernel runs
+  // `n` full stages plus stage `n` blended in with a weight ramping f0 -> f1.
+  class MOT_FracCount {
+    constructor() { this.v = -1; this.n = 0; this.f0 = 0; this.f1 = 0; }
+    step(target, max, rate) {
+      target = Math.max(0, Math.min(max, target));
+      if (this.v < 0) this.v = target;
+      const v0 = this.v, up = target >= v0;
+      if (up && v0 >= max) { this.n = max - 1; this.f0 = this.f1 = 1; this.v = max; return this.n; }
+      const base = up ? Math.floor(v0) : Math.ceil(v0) - 1;
+      const v1 = Math.max(base, Math.min(base + 1, v0 + Math.max(-rate, Math.min(rate, target - v0))));
+      this.n = base; this.f0 = v0 - base; this.f1 = v1 - base; this.v = v1;
+      return base;
+    }
+  }
+
   // Key-snap cache (KeyHelper.snapHz is a linear search; only redo it when needed)
   class MOT_Snap {
     constructor() { this.inp = -1; this.out = 0; this.notes = null; }
