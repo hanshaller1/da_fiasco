@@ -96,24 +96,24 @@ class Biquad { // RBJ cookbook, transposed direct form II. Mono.
   _set(b0, b1, b2, a0, a1, a2) {
     const ia = 1 / a0; this.b0 = b0 * ia; this.b1 = b1 * ia; this.b2 = b2 * ia; this.a1 = a1 * ia; this.a2 = a2 * ia;
   }
-  _w(f, sr) { const w = TAU * clamp(f, 5, sr * 0.49) / sr; return [Math.cos(w), Math.sin(w)]; }
-  lp(f, q, sr) { const [c, s] = this._w(f, sr), al = s / (2 * q); this._set((1 - c) / 2, 1 - c, (1 - c) / 2, 1 + al, -2 * c, 1 - al); return this; }
-  hp(f, q, sr) { const [c, s] = this._w(f, sr), al = s / (2 * q); this._set((1 + c) / 2, -(1 + c), (1 + c) / 2, 1 + al, -2 * c, 1 - al); return this; }
-  bp(f, q, sr) { const [c, s] = this._w(f, sr), al = s / (2 * q); this._set(al, 0, -al, 1 + al, -2 * c, 1 - al); return this; } // 0 dB peak
-  notch(f, q, sr) { const [c, s] = this._w(f, sr), al = s / (2 * q); this._set(1, -2 * c, 1, 1 + al, -2 * c, 1 - al); return this; }
-  ap(f, q, sr) { const [c, s] = this._w(f, sr), al = s / (2 * q); this._set(1 - al, -2 * c, 1 + al, 1 + al, -2 * c, 1 - al); return this; }
+  _w(f, sr) { const w = TAU * clamp(f, 5, sr * 0.49) / sr; this._c = Math.cos(w); this._s = Math.sin(w); } // no allocation
+  lp(f, q, sr) { this._w(f, sr); const c = this._c, s = this._s, al = s / (2 * q); this._set((1 - c) / 2, 1 - c, (1 - c) / 2, 1 + al, -2 * c, 1 - al); return this; }
+  hp(f, q, sr) { this._w(f, sr); const c = this._c, s = this._s, al = s / (2 * q); this._set((1 + c) / 2, -(1 + c), (1 + c) / 2, 1 + al, -2 * c, 1 - al); return this; }
+  bp(f, q, sr) { this._w(f, sr); const c = this._c, s = this._s, al = s / (2 * q); this._set(al, 0, -al, 1 + al, -2 * c, 1 - al); return this; } // 0 dB peak
+  notch(f, q, sr) { this._w(f, sr); const c = this._c, s = this._s, al = s / (2 * q); this._set(1, -2 * c, 1, 1 + al, -2 * c, 1 - al); return this; }
+  ap(f, q, sr) { this._w(f, sr); const c = this._c, s = this._s, al = s / (2 * q); this._set(1 - al, -2 * c, 1 + al, 1 + al, -2 * c, 1 - al); return this; }
   peak(f, q, db, sr) {
-    const [c, s] = this._w(f, sr), A = Math.pow(10, db / 40), al = s / (2 * q);
+    this._w(f, sr); const c = this._c, s = this._s, A = Math.pow(10, db / 40), al = s / (2 * q);
     this._set(1 + al * A, -2 * c, 1 - al * A, 1 + al / A, -2 * c, 1 - al / A); return this;
   }
   lowShelf(f, db, sr, slope = 1) {
-    const [c, s] = this._w(f, sr), A = Math.pow(10, db / 40);
+    this._w(f, sr); const c = this._c, s = this._s, A = Math.pow(10, db / 40);
     const al = s / 2 * Math.sqrt((A + 1 / A) * (1 / slope - 1) + 2), sa = 2 * Math.sqrt(A) * al;
     this._set(A * ((A + 1) - (A - 1) * c + sa), 2 * A * ((A - 1) - (A + 1) * c), A * ((A + 1) - (A - 1) * c - sa),
       (A + 1) + (A - 1) * c + sa, -2 * ((A - 1) + (A + 1) * c), (A + 1) + (A - 1) * c - sa); return this;
   }
   highShelf(f, db, sr, slope = 1) {
-    const [c, s] = this._w(f, sr), A = Math.pow(10, db / 40);
+    this._w(f, sr); const c = this._c, s = this._s, A = Math.pow(10, db / 40);
     const al = s / 2 * Math.sqrt((A + 1 / A) * (1 / slope - 1) + 2), sa = 2 * Math.sqrt(A) * al;
     this._set(A * ((A + 1) + (A - 1) * c + sa), -2 * A * ((A - 1) + (A + 1) * c), A * ((A + 1) + (A - 1) * c - sa),
       (A + 1) - (A - 1) * c + sa, 2 * ((A - 1) - (A + 1) * c), (A + 1) - (A - 1) * c - sa); return this;
@@ -362,17 +362,20 @@ class KeyHelper {
   // snap an interval in semitones to the nearest interval of the scale (relative to root)
   snapSemis(s) {
     const o = Math.floor(s / 12), r = s - o * 12; let best = 0, bd = 1e9;
-    for (const iv of this.intervals.concat([12])) { const d = Math.abs(iv - r); if (d < bd) { bd = d; best = iv; } }
+    const iv = this.intervals;
+    for (let i = 0; i < iv.length; i++) { const d = Math.abs(iv[i] - r); if (d < bd) { bd = d; best = iv[i]; } }
+    if (Math.abs(12 - r) < bd) best = 12;
     return best + o * 12;
   }
   // chord tones as semitone offsets above root (sorted)
-  chordSemis() { return this.chord.slice(); }
+  chordSemis() { return this.chord; } // shared array: do not modify
   // chord tones as midi notes around an octave
   chordMidi(octave = 3) { return this.chord.map((s) => 12 * (octave + 1) + this.root + s); }
   // nearest chord tone (any octave) to midi note m
   snapChordMidi(m) {
     let best = m, bd = 1e9;
-    for (let o = -1; o <= 10; o++) for (const s of this.chord) { const n = 12 * o + this.root + s; const d = Math.abs(n - m); if (d < bd) { bd = d; best = n; } }
+    const ch = this.chord;
+    for (let o = -1; o <= 10; o++) for (let k = 0; k < ch.length; k++) { const n = 12 * o + this.root + ch[k]; const d = Math.abs(n - m); if (d < bd) { bd = d; best = n; } }
     return best;
   }
 }

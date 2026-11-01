@@ -103,30 +103,46 @@
     }
   }
 
-  // Linkwitz-Riley 4th-order crossover (2 or 3 bands, phase-aligned sum).
+  // Stereo biquad section; `cascade` = 2 runs the same biquad twice (Butterworth^2 = LR4).
+  // Coefficients come from the DRV_bq* setters (they only call _set). Outputs in .l / .r.
+  class DRV_SBQ {
+    constructor(cascade) {
+      this.two = cascade === 2; this.b0 = 1; this.b1 = 0; this.b2 = 0; this.a1 = 0; this.a2 = 0;
+      this.l1 = this.l2 = this.m1 = this.m2 = this.r1 = this.r2 = this.q1 = this.q2 = 0; this.l = 0; this.r = 0;
+    }
+    _set(b0, b1, b2, a0, a1, a2) { const ia = 1 / a0; this.b0 = b0 * ia; this.b1 = b1 * ia; this.b2 = b2 * ia; this.a1 = a1 * ia; this.a2 = a2 * ia; }
+    process(l, r) {
+      const b0 = this.b0, b1 = this.b1, b2 = this.b2, a1 = this.a1, a2 = this.a2;
+      let y = b0 * l + this.l1; this.l1 = b1 * l - a1 * y + this.l2; this.l2 = b2 * l - a2 * y;
+      let z = b0 * r + this.r1; this.r1 = b1 * r - a1 * z + this.r2; this.r2 = b2 * r - a2 * z;
+      if (this.two) {
+        const y2 = b0 * y + this.m1; this.m1 = b1 * y - a1 * y2 + this.m2; this.m2 = b2 * y - a2 * y2; y = y2;
+        const z2 = b0 * z + this.q1; this.q1 = b1 * z - a1 * z2 + this.q2; this.q2 = b2 * z - a2 * z2; z = z2;
+      }
+      this.l = y; this.r = z;
+    }
+  }
+  // Stereo Linkwitz-Riley 4th-order crossover (2 or 3 bands, phase-aligned sum).
   class DRV_XO {
     constructor() {
-      this.a1 = new Biquad(); this.a2 = new Biquad(); this.b1 = new Biquad(); this.b2 = new Biquad();
-      this.c1 = new Biquad(); this.c2 = new Biquad(); this.d1 = new Biquad(); this.d2 = new Biquad(); this.ap = new Biquad();
-      this.f1 = -1; this.f2 = -1; this.lo = 0; this.mid = 0; this.hi = 0;
+      this.lp1 = new DRV_SBQ(2); this.hp1 = new DRV_SBQ(2); this.lp2 = new DRV_SBQ(2); this.hp2 = new DRV_SBQ(2); this.ap = new DRV_SBQ(1);
+      this.f1 = -1; this.f2 = -1;
+      this.loL = this.loR = this.midL = this.midR = this.hiL = this.hiR = 0;
     }
     set(f1, f2, sr) {
-      if (f1 !== this.f1) {
-        this.f1 = f1; DRV_bqLP(this.a1, f1, DRV_Q, sr); DRV_bqLP(this.a2, f1, DRV_Q, sr);
-        DRV_bqHP(this.b1, f1, DRV_Q, sr); DRV_bqHP(this.b2, f1, DRV_Q, sr);
-      }
-      if (f2 !== this.f2) {
-        this.f2 = f2; DRV_bqLP(this.c1, f2, DRV_Q, sr); DRV_bqLP(this.c2, f2, DRV_Q, sr);
-        DRV_bqHP(this.d1, f2, DRV_Q, sr); DRV_bqHP(this.d2, f2, DRV_Q, sr); DRV_bqAP(this.ap, f2, DRV_Q, sr);
-      }
+      if (f1 !== this.f1) { this.f1 = f1; DRV_bqLP(this.lp1, f1, DRV_Q, sr); DRV_bqHP(this.hp1, f1, DRV_Q, sr); }
+      if (f2 !== this.f2) { this.f2 = f2; DRV_bqLP(this.lp2, f2, DRV_Q, sr); DRV_bqHP(this.hp2, f2, DRV_Q, sr); DRV_bqAP(this.ap, f2, DRV_Q, sr); }
     }
-    split2(x) { this.lo = this.a2.process(this.a1.process(x)); this.hi = this.b2.process(this.b1.process(x)); }
-    split3(x) {
-      this.split2(x);
-      const h = this.hi;
-      this.lo = this.ap.process(this.lo);
-      this.mid = this.c2.process(this.c1.process(h));
-      this.hi = this.d2.process(this.d1.process(h));
+    split2(l, r) {
+      this.lp1.process(l, r); this.hp1.process(l, r);
+      this.loL = this.lp1.l; this.loR = this.lp1.r; this.hiL = this.hp1.l; this.hiR = this.hp1.r;
+    }
+    split3(l, r) {
+      this.split2(l, r);
+      const hl = this.hiL, hr = this.hiR;
+      this.ap.process(this.loL, this.loR); this.loL = this.ap.l; this.loR = this.ap.r;
+      this.lp2.process(hl, hr); this.hp2.process(hl, hr);
+      this.midL = this.lp2.l; this.midR = this.lp2.r; this.hiL = this.hp2.l; this.hiR = this.hp2.r;
     }
   }
 
@@ -1015,7 +1031,7 @@
       { id: 'hix', label: 'HI X', min: 800, max: 10000, def: 2500, unit: 'Hz', curve: 'exp' },
     ];
     init() {
-      this.xl = new DRV_XO(); this.xr = new DRV_XO();
+      this.xo = new DRV_XO();
       this.env = new Float64Array(3); this.ca = new Float64Array(3); this.cr = new Float64Array(3);
       this.gc = new Float64Array([1, 1, 1]); this.gs = new Float64Array(3);
       this.gi = -1; this.go = -1;
@@ -1030,16 +1046,16 @@
       this.depth = p.depth * 0.01; this.Rd = 1 + 9 * p.downward * 0.01; this.Ru = 1 + 3 * p.upward * 0.01; this.mk = this.depth * 8;
       const tf = 0.1 * Math.pow(100, p.time * 0.01);
       for (let b = 0; b < 3; b++) { ca[b] = DRV_coef(SQ_ATT[b] * tf, sr); cr[b] = DRV_coef(SQ_REL[b] * tf, sr); }
-      if (nb > 1) { this.xl.set(p.lox, p.hix, sr); this.xr.set(p.lox, p.hix, sr); }
+      if (nb > 1) this.xo.set(p.lox, p.hix, sr);
       const giT = dbToGain(p.input), gi0 = this.gi < 0 ? giT : this.gi, dgi = (giT - gi0) / n; this.gi = giT;
       const goT = dbToGain(p.output), go0 = this.go < 0 ? goT : this.go, dgo = (goT - go0) / n; this.go = goT;
-      const xl = this.xl, xr = this.xr, ca0 = ca[0], ca1 = ca[1], ca2 = ca[2], cr0 = cr[0], cr1 = cr[1], cr2 = cr[2];
+      const xo = this.xo, ca0 = ca[0], ca1 = ca[1], ca2 = ca[2], cr0 = cr[0], cr1 = cr[1], cr2 = cr[2];
       let e0 = env[0], e1 = env[1], e2 = env[2], g0 = gc[0], g1 = gc[1], g2 = gc[2], s0 = gs[0], s1 = gs[1], s2 = gs[2];
       for (let i = 0; i < n; i++) {
         const gi = gi0 + dgi * (i + 1), l = L[i] * gi, r = R[i] * gi;
         let l0 = l, r0 = r, l1 = 0, r1 = 0, l2 = 0, r2 = 0, a, d;
-        if (nb === 2) { xl.split2(l); xr.split2(r); l0 = xl.lo; r0 = xr.lo; l1 = xl.hi; r1 = xr.hi; }
-        else if (nb === 3) { xl.split3(l); xr.split3(r); l0 = xl.lo; r0 = xr.lo; l1 = xl.mid; r1 = xr.mid; l2 = xl.hi; r2 = xr.hi; }
+        if (nb === 2) { xo.split2(l, r); l0 = xo.loL; r0 = xo.loR; l1 = xo.hiL; r1 = xo.hiR; }
+        else if (nb === 3) { xo.split3(l, r); l0 = xo.loL; r0 = xo.loR; l1 = xo.midL; r1 = xo.midR; l2 = xo.hiL; r2 = xo.hiR; }
         // stereo-linked peak envelopes per band
         a = l0 < 0 ? -l0 : l0; d = r0 < 0 ? -r0 : r0; if (a > d) d = a; e0 += (d - e0) * (d > e0 ? ca0 : cr0);
         a = l1 < 0 ? -l1 : l1; d = r1 < 0 ? -r1 : r1; if (a > d) d = a; e1 += (d - e1) * (d > e1 ? ca1 : cr1);
@@ -1144,8 +1160,7 @@
     ];
     init() {
       const sr = this.sr;
-      this.xl = new DRV_XO(); this.xr = new DRV_XO();
-      this.xl.set(150, 2500, sr); this.xr.set(150, 2500, sr);
+      this.xo = new DRV_XO(); this.xo.set(150, 2500, sr);
       this.e0 = 0; this.e1 = 0; this.e2 = 0;
       this.ch = [0, 1].map(() => ({ dc: new DCBlock(0.999), tilt: new DRV_Tilt(sr) }));
       this.lv = new DRV_Level(sr, 900, 0.25, 4);
@@ -1157,7 +1172,7 @@
       if (!melt) { thr = -8 - 26 * br; ratio = 2 + 14 * br; att = 8 - 6 * br; rel = 90 + 450 * pump; uThr = thr - 14; uR = 1 + 3 * lift; uMax = 15 * lift; kG = 1 + 8 * grit; }
       else { thr = -14 - 20 * br; ratio = 1.5 + 5 * br; att = 18 - 8 * br; rel = 220 + 700 * pump; uThr = -34; uR = 1 + 6 * lift; uMax = 24 * lift; kG = 1 + 5 * grit; }
       const ca = DRV_coef(att, sr), cr = DRV_coef(rel, sr), key = pump * 1.5, ikG = 1 / kG;
-      const xl = this.xl, xr = this.xr, sL = this.ch[0], sR = this.ch[1];
+      const xo = this.xo, sL = this.ch[0], sR = this.ch[1];
       sL.tilt.set(p.tone * 0.01); sR.tilt.set(p.tone * 0.01);
       let e0 = this.e0, e1 = this.e1, e2 = this.e2;
       lv.begin(n);
@@ -1165,38 +1180,38 @@
       let si = 0, so = 0;
       for (let i = 0; i < n; i++) {
         const l = L[i], r = R[i];
-        if (melt) { xl.split3(l); xr.split3(r); } else { xl.split2(l); xr.split2(r); }
+        if (melt) xo.split3(l, r); else xo.split2(l, r);
         let a, d;
-        a = xl.lo < 0 ? -xl.lo : xl.lo; d = xr.lo < 0 ? -xr.lo : xr.lo; if (a > d) d = a;
+        a = xo.loL < 0 ? -xo.loL : xo.loL; d = xo.loR < 0 ? -xo.loR : xo.loR; if (a > d) d = a;
         const dLow = d;
         e0 += (d - e0) * (d > e0 ? ca : cr);
         a = DRV_DB * Math.log(e0 + 1e-9);
         const g0 = Math.exp((DRV_down(a, thr, ratio, 8) + DRV_up(a, uThr, uR, uMax, -60)) * DRV_LN);
         let ol, or;
         if (!melt) {
-          const hl = xl.hi, hr = xr.hi;
+          const hl = xo.hiL, hr = xo.hiR;
           a = hl < 0 ? -hl : hl; d = hr < 0 ? -hr : hr; if (a > d) d = a;
           if (dLow * key > d) d = dLow * key; // PUMP: the low band keys the top band
           e1 += (d - e1) * (d > e1 ? ca : cr);
           a = DRV_DB * Math.log(e1 + 1e-9);
           const g1 = Math.exp((DRV_down(a, thr - 4, ratio, 8) + DRV_up(a, uThr - 4, uR, uMax, -62)) * DRV_LN);
-          ol = fastTanh(xl.lo * g0 * kG) * ikG + softClip(hl * g1 * kG * 1.2) * ikG;
-          or = fastTanh(xr.lo * g0 * kG) * ikG + softClip(hr * g1 * kG * 1.2) * ikG;
+          ol = fastTanh(xo.loL * g0 * kG) * ikG + softClip(hl * g1 * kG * 1.2) * ikG;
+          or = fastTanh(xo.loR * g0 * kG) * ikG + softClip(hr * g1 * kG * 1.2) * ikG;
         } else {
-          a = xl.mid < 0 ? -xl.mid : xl.mid; d = xr.mid < 0 ? -xr.mid : xr.mid; if (a > d) d = a;
+          a = xo.midL < 0 ? -xo.midL : xo.midL; d = xo.midR < 0 ? -xo.midR : xo.midR; if (a > d) d = a;
           if (dLow * key > d) d = dLow * key;
           e1 += (d - e1) * (d > e1 ? ca : cr);
           a = DRV_DB * Math.log(e1 + 1e-9);
           const g1 = Math.exp((DRV_down(a, thr - 3, ratio, 10) + DRV_up(a, uThr - 3, uR, uMax, -62)) * DRV_LN);
-          a = xl.hi < 0 ? -xl.hi : xl.hi; d = xr.hi < 0 ? -xr.hi : xr.hi; if (a > d) d = a;
+          a = xo.hiL < 0 ? -xo.hiL : xo.hiL; d = xo.hiR < 0 ? -xo.hiR : xo.hiR; if (a > d) d = a;
           if (dLow * key > d) d = dLow * key;
           e2 += (d - e2) * (d > e2 ? ca : cr);
           a = DRV_DB * Math.log(e2 + 1e-9);
           const g2 = Math.exp((DRV_down(a, thr - 6, ratio, 10) + DRV_up(a, uThr - 6, uR, uMax, -64)) * DRV_LN);
           // "melt" saturation: asymmetric, softer
-          let v = (xl.lo * g0 + xl.mid * g1 + xl.hi * g2) * kG;
+          let v = (xo.loL * g0 + xo.midL * g1 + xo.hiL * g2) * kG;
           ol = (v >= 0 ? fastTanh(v) : fastTanh(v * 1.3) * 0.77) * ikG;
-          v = (xr.lo * g0 + xr.mid * g1 + xr.hi * g2) * kG;
+          v = (xo.loR * g0 + xo.midR * g1 + xo.hiR * g2) * kG;
           or = (v >= 0 ? fastTanh(v) : fastTanh(v * 1.3) * 0.77) * ikG;
         }
         ol = sL.dc.process(ol); or = sR.dc.process(or);
@@ -1230,21 +1245,21 @@
       { id: 'band', label: 'BAND', options: ['HIGH', 'LOW'], def: 0 },
     ];
     init() {
-      this.xl = new DRV_XO(); this.xr = new DRV_XO();
+      this.xo = new DRV_XO();
       this.pw = 0; this.e2 = 0; this.e3 = 0; this.gs = 1;
     }
     process(L, R, n, p) {
       const sr = this.sr, si = p.split | 0, low = (p.band | 0) === 1;
-      if (si > 0) { this.xl.set(SH_FREQ[si], 20000, sr); this.xr.set(SH_FREQ[si], 20000, sr); }
+      if (si > 0) this.xo.set(SH_FREQ[si], 20000, sr);
       const atk = p.attack * 0.005, sus = p.sustain * 0.005;
       const cP = DRV_coef(2, sr), rF = DRV_coef(20, sr), aS = DRV_coef(p.time, sr), rS = DRV_coef(p.release, sr), gc = DRV_coef(0.5, sr);
-      const xl = this.xl, xr = this.xr;
+      const xo = this.xo;
       let pw = this.pw, e2 = this.e2, e3 = this.e3, gs = this.gs;
       for (let i = 0; i < n; i++) {
         let bl = L[i], br = R[i], ol = 0, or = 0;
         if (si > 0) {
-          xl.split2(bl); xr.split2(br);
-          if (low) { bl = xl.lo; br = xr.lo; ol = xl.hi; or = xr.hi; } else { bl = xl.hi; br = xr.hi; ol = xl.lo; or = xr.lo; }
+          xo.split2(bl, br);
+          if (low) { bl = xo.loL; br = xo.loR; ol = xo.hiL; or = xo.hiR; } else { bl = xo.hiL; br = xo.hiR; ol = xo.loL; or = xo.loR; }
         }
         const al = bl < 0 ? -bl : bl, ar = br < 0 ? -br : br, d = al > ar ? al : ar;
         pw += (d * d - pw) * cP; // short power average: little ripple on steady tones
