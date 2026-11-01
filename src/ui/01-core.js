@@ -4,10 +4,11 @@
 'use strict';
 
 const DSP_SRC = document.getElementById('dsp-src').textContent;
-const DSP = new Function(DSP_SRC + `
-return { UNITS, FX_REGISTRY, HOST_FX_PARAMS, DebacleEngine, prepParam, normToValue, valueToNorm, formatValue,
+// The DSP script above runs on the main thread too (for metadata and the ScriptProcessor
+// fallback); its source text is handed to the AudioWorklet. No eval needed.
+const DSP = { UNITS, FX_REGISTRY, HOST_FX_PARAMS, DebacleEngine, prepParam, normToValue, valueToNorm, formatValue,
   MOD_SOURCES, MOD_SOURCE_IDS, LFO_SHAPES, WARP_ZONES, BREAK_ZONES, zoneOf, DEFAULT_GRAPHS, evalGraph, defaultSeq,
-  SLOT_SHAPES, DIV_BEATS, NOTE_NAMES, SCALE_NAMES, LINK_PRESETS, TE_SEQ_RATES, clamp, CHORD_NAMES };`)();
+  SLOT_SHAPES, DIV_BEATS, NOTE_NAMES, SCALE_NAMES, LINK_PRESETS, TE_SEQ_RATES, clamp, CHORD_NAMES };
 
 const $ = (sel, el = document) => el.querySelector(sel);
 const $$ = (sel, el = document) => [...el.querySelectorAll(sel)];
@@ -17,7 +18,7 @@ function h(tag, attrs, ...kids) {
   if (attrs) for (const [k, v] of Object.entries(attrs)) {
     if (v === undefined || v === null || v === false) continue;
     if (k === 'class') el.className = v;
-    else if (k === 'style' && typeof v === 'object') Object.assign(el.style, v);
+    else if (k === 'style' && typeof v === 'object') { for (const [sk, sv] of Object.entries(v)) { if (sk.startsWith('--')) el.style.setProperty(sk, sv); else el.style[sk] = sv; } }
     else if (k.startsWith('on')) el.addEventListener(k.slice(2), v);
     else if (k === 'html') el.innerHTML = v;
     else el.setAttribute(k, v === true ? '' : v);

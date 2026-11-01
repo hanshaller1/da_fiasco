@@ -15,6 +15,11 @@ const dsp = dspOrder.map((f) => `// ---- ${f}\n` + rd('src/dsp/' + f)).join('\n'
 const uiFiles = fs.readdirSync(path.join(root, 'src/ui')).filter((f) => f.endsWith('.js')).sort();
 const ui = uiFiles.map((f) => `// ---- ${f}\n` + rd('src/ui/' + f)).join('\n');
 if (/<\/script|<!--/i.test(dsp + ui)) throw new Error('inline source contains </script or <!--');
+// DSP and UI share the page's global scope: refuse duplicate top-level names
+const tops = (src) => new Set([...src.matchAll(/^(?:const|let|var|class|function)\s+([A-Za-z_$][\w$]*)/gm)].map((m) => m[1]));
+const dTop = tops(dsp), uTop = tops(ui);
+const clash = [...uTop].filter((n) => dTop.has(n));
+if (clash.length) throw new Error('top-level name clash between DSP and UI: ' + clash.join(', '));
 
 let frag = rd('src/index.html');
 frag = frag.replace('/*__STYLE__*/', () => rd('src/style.css'));

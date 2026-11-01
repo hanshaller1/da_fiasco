@@ -199,6 +199,7 @@ body.playing .play .ic-play { display: none; }
 .fx-lib-desc { grid-column: 1 / -1; font-size: 11px; color: var(--fg-faint); line-height: 1.25; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
 .fx-lib-item.in .fx-lib-name { color: var(--cat); }
 .fx-lib-item.in .fx-lib-name::after { content: " ●"; font-size: 9px; vertical-align: middle; }
+.fx-lib-item .lat { grid-row: 1; grid-column: 2; justify-self: end; }
 .lat { font: 600 9px var(--f-mono); color: var(--c-spectral); border: 1px solid currentColor; border-radius: 3px; padding: 0 3px; align-self: center; }
 .fx-main { min-width: 0; }
 .fx-toolbar { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 10px; }
