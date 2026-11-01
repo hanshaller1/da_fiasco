@@ -16,6 +16,7 @@
   const SPX_DB2LN = Math.LN10 / 20;           // dB -> ln(amplitude)
   const SPX_SIZES = ['512', '1K', '2K', '4K'];
   const SPX_coef = (sec, hop, sr) => (sec <= 1e-6 ? 1 : 1 - Math.exp(-hop / (sec * sr)));
+  const SPX_lg = (db) => (db <= -59.5 ? 0 : Math.exp(db * SPX_DB2LN)); // layer gain, -60 dB = off
   const SPX_sstep = (x) => (x <= 0 ? 0 : x >= 1 ? 1 : x * x * (3 - 2 * x));
   function SPX_lerpA(a, x, B) {
     if (x < 0) return 0;
@@ -97,6 +98,10 @@
       this._cb = (re, im, ch, N) => { this.frame(re, im, ch, N); if (ch === 1) this._fc++; };
       this._pad0 = new Float32Array(8192); this._pad1 = new Float32Array(8192); this._pw = 0;
       this._dc0 = 0; this._dc1 = 0; this._last0 = 0; this._last1 = 0;
+      if (C.hasSize) { // input history + scratch to prime a newly selected FFT size
+        this._h0 = new Float32Array(8192); this._h1 = new Float32Array(8192); this._hw = 0; this._hn = 0;
+        this._s0 = new Float32Array(8192); this._s1 = new Float32Array(8192);
+      }
       this.rng = new Rng((0x9E3779B9 ^ (C.id.charCodeAt(0) * 7919 + C.id.length * 104729)) >>> 0);
       this.agcG = 1; this._Ei = 0; this._Eo = 0; this._ei = 0; this._eo = 0;
       this.agcT = [0.25, 0.25, 0.03, 0]; // energy averaging, gain-up, gain-down times (s); [3]=1: fast-rise envelopes
@@ -123,6 +128,22 @@
       this.stft.reset(); this.clear();
       this._pad0.fill(0); this._pad1.fill(0); this._pw = 0;
       this._dc0 = this._dc1 = this._last0 = this._last1 = 0;
+      if (this._h0) { this._h0.fill(0); this._h1.fill(0); this._hw = 0; this._hn = 0; }
+    }
+    // After a SIZE change: run the recent input history through the new STFT so its
+    // overlap-add is complete and the latency pad holds time-aligned output → no gap.
+    _prime(p, ctx, n) {
+      const N = this.N, pad = this.L - N, P = Math.min((pad > 0 ? pad : 0) + 2 * N, this._hn - n, 8192 - n);
+      if (P < N) return;
+      const h0 = this._h0, h1 = this._h1, a = this._s0, b = this._s1, base = this._hw - n - P;
+      for (let j = 0; j < P; j++) { const r = (base + j) & 8191; a[j] = h0[r]; b[j] = h1[r]; }
+      this._ppq0 = (ctx.ppq || 0) - P / this._spb; this._first = N - this.stft.rover - 1; this._fc = 0;
+      this.block(p, ctx, P);
+      this.stft.process(a, b, P, this._cb);
+      if (pad > 0) {
+        const q0 = this._pad0, q1 = this._pad1, w = this._pw - P;
+        for (let j = 0; j < P; j++) { const r = (w + j) & 8191; q0[r] = a[j]; q1[r] = b[j]; }
+      }
     }
     // musical position (quarter notes) of the centre of the frame being processed
     framePPQ() { return this._ppq0 + (this._first + this._fc * this.hop + 1 - this.N * 0.5) / this._spb; }
@@ -144,12 +165,17 @@
       this.agcG = g + (t - g) * (t < g ? this._agcD : this._agcU);
     }
     process(L, R, n, p, ctx) {
-      if (this.constructor.hasSize) {
-        const want = 512 << clamp(p.size | 0, 0, 3);
-        if (want !== this.N) { this._dc0 = this._last0; this._dc1 = this._last1; this._use(want); }
-      }
       this.p = p; this.ctx = ctx;
-      this._ppq0 = ctx.ppq || 0; this._spb = ctx.spb > 1 ? ctx.spb : this.sr / 2;
+      this._spb = ctx.spb > 1 ? ctx.spb : this.sr / 2;
+      let sw = false;
+      if (this.constructor.hasSize) {
+        const h0 = this._h0, h1 = this._h1; let hw = this._hw;
+        for (let i = 0; i < n; i++) { h0[hw] = L[i]; h1[hw] = R[i]; hw = (hw + 1) & 8191; }
+        this._hw = hw; if (this._hn < 8192) this._hn += n;
+        const want = 512 << clamp(p.size | 0, 0, 3);
+        if (want !== this.N) { this._use(want); this._prime(p, ctx, n); sw = true; }
+      }
+      this._ppq0 = ctx.ppq || 0;
       this._first = this.N - this.stft.rover - 1; this._fc = 0;
       this.block(p, ctx, n);
       this.stft.process(L, R, n, this._cb);
@@ -164,6 +190,7 @@
         }
         this._pw = w;
       }
+      if (sw) { this._dc0 = this._last0 - L[0]; this._dc1 = this._last1 - R[0]; } // continuity across the switch
       let d0 = this._dc0, d1 = this._dc1;
       for (let i = 0; i < n; i++) {
         let x = L[i] + d0, y = R[i] + d1;
@@ -453,11 +480,11 @@
           T[k] = clamp((te - dist) / ew + 0.5, 0, 1);
         }
       }
-      // makeup gain from the pass fraction under a pink (1/f) weighting, 40 Hz..16 kHz, ≤ +8 dB
+      // partial makeup gain from the pass fraction under a pink (1/f) weighting, 40 Hz..16 kHz, ≤ +6 dB
       let num = 0, den = 0;
       const k0 = Math.max(1, Math.round(40 / binHz)), k1 = Math.min(B - 1, Math.round(16000 / binHz));
       for (let k = k0; k <= k1; k++) { const w = 1 / k; num += T[k] * T[k] * w; den += w; }
-      this.mk = clamp(Math.sqrt(den / Math.max(num, 1e-9)), 1, 2.5);
+      this.mk = clamp(Math.pow(den / Math.max(num, 1e-9), 0.35), 1, 2);
     }
     frame(re, im, ch) {
       const st = this.st, B = this.B;
@@ -514,10 +541,10 @@
       this.lc = Math.log2(c);
       const g = this.st.g, lf = this.st.t.lf, B = this.B, lc = this.lc, is2 = 0.5 / (this.sig * this.sig), gain = this.gain, tilt = this.tilt;
       for (let k = 0; k < B; k++) {
-        const d = lf[k] - lc, dt = lf[k] - 9.9658; // tilt pivots at 1 kHz
-        let db = gain * Math.exp(-d * d * is2) + tilt * (dt < -5.5 ? -5.5 : dt > 4.5 ? 4.5 : dt);
+        const d = lf[k] - lc, dt = lf[k] - 9.9658, e = d * d * is2; // tilt pivots at 1 kHz
+        let db = (e < 12 ? gain * Math.exp(-e) : 0) + tilt * (dt < -5.5 ? -5.5 : dt > 4.5 ? 4.5 : dt);
         db = db < -60 ? -60 : db > 24 ? 24 : db;
-        g[k] = Math.exp(db * SPX_DB2LN);
+        g[k] = SPX_dbg(db);
       }
     }
     frame(re, im, ch) {
@@ -545,7 +572,7 @@
       } else {
         for (let k = 0; k < B; k++) { const v = g[k]; re[k] *= v; im[k] *= v; }
       }
-      this.agc(re, im, ch, ein, 0.15, 1);
+      this.agc(re, im, ch, ein, 0.05, 1);
     }
   });
 
@@ -582,7 +609,6 @@
       if (c[0] !== lo || c[1] !== hi || c[2] !== this.N) {
         c[0] = lo; c[1] = hi; c[2] = this.N;
         const wr = this.st.wr, B = this.B, binHz = this.sr / this.N, llo = Math.log2(lo), lhi = Math.log2(hi);
-        this.k0 = 1; this.k1 = 0;
         for (let k = 0; k < B; k++) {
           const lf = Math.log2(Math.max(0.5, k) * binHz);
           wr[k] = SPX_sstep((lf - llo) * 4 + 0.5) * SPX_sstep((lhi - lf) * 4 + 0.5);
@@ -661,9 +687,9 @@
     static desc = 'Splits the signal into tonal, noise and hit layers by spectral stability, with a gain for each layer, pitch-shift for the tonal layer and stereo spread for the noise.';
     static latency = 2048;
     static params = [
-      { id: 'tonal', label: 'TONAL', min: -60, max: 12, def: 0, unit: 'dB', bipolar: true },
-      { id: 'noise', label: 'NOISE', min: -60, max: 12, def: -12, unit: 'dB', bipolar: true },
-      { id: 'hits', label: 'HITS', min: -60, max: 12, def: 4, unit: 'dB', bipolar: true },
+      { id: 'tonal', label: 'TONAL', min: -60, max: 6, def: 0, unit: 'dB', bipolar: true },
+      { id: 'noise', label: 'NOISE', min: -60, max: 6, def: -12, unit: 'dB', bipolar: true },
+      { id: 'hits', label: 'HITS', min: -60, max: 6, def: 3, unit: 'dB', bipolar: true },
       { id: 'pitch', label: 'PITCH', min: -12, max: 12, def: 0, unit: 'st', bipolar: true },
       { id: 'spread', label: 'SPREAD', min: 0, max: 100, def: 50, unit: '%' },
       { id: 'tight', label: 'TIGHT', min: 0, max: 100, def: 50, unit: '%' },
@@ -680,8 +706,7 @@
     }
     onClear() { this.st.pv.clear(); this.cSp = NaN; }
     block(p, ctx) {
-      const g = (db) => (db <= -59.5 ? 0 : Math.exp(db * SPX_DB2LN));
-      this.gT = g(p.tonal); this.gN = g(p.noise); this.gH = g(p.hits);
+      this.gT = SPX_lg(p.tonal); this.gN = SPX_lg(p.noise); this.gH = SPX_lg(p.hits);
       let pi = p.pitch;
       if (p.snap >= 0.5) pi = ctx.key.snapSemis(Math.round(pi));
       this.pitch = pi / 12;
@@ -951,7 +976,7 @@
       pv.render(re, im, ch, this.gl, 0);
       const tg = st.tg;
       for (let k = 0; k < B; k++) { re[k] *= tg[k]; im[k] *= tg[k]; }
-      this.agc(re, im, ch, ein, 0.2, 2);
+      this.agc(re, im, ch, ein, 0.05, 2);
     }
   });
 
@@ -1138,7 +1163,7 @@
     static latency = 2048;
     static hasSize = true;
     static params = [
-      { id: 'shift', label: 'SHIFT', min: -12, max: 12, def: 5, unit: 'st', bipolar: true },
+      { id: 'shift', label: 'SHIFT', min: -12, max: 12, def: 7, unit: 'st', bipolar: true },
       { id: 'detail', label: 'DETAIL', min: 0, max: 100, def: 40, unit: '%' },
       { id: 'spread', label: 'SPREAD', min: 0, max: 6, def: 0, unit: 'st' },
       { id: 'size', label: 'SIZE', options: SPX_SIZES, def: 2 },

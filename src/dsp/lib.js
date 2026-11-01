@@ -269,33 +269,47 @@ class STFT {
     this.rover = this._lat; this.frameCount = 0;
   }
   process(L, R, n, frame) {
-    const N = this.N, lat = this._lat, chans = [L, R];
+    const N = this.N, lat = this._lat;
+    const inL = this.inF[0], inR = this.inF[1], outL = this.outF[0], outR = this.outF[1];
     for (let i = 0; i < n; i++) {
-      for (let c = 0; c < 2; c++) {
-        this.inF[c][this.rover] = chans[c][i];
-        chans[c][i] = this.outF[c][this.rover - lat];
-      }
-      this.rover++;
-      if (this.rover >= N) {
-        this.rover = lat;
-        for (let c = 0; c < 2; c++) this._frame(c, frame);
-        this.frameCount++;
-      }
+      const r = this.rover;
+      inL[r] = L[i]; inR[r] = R[i];
+      L[i] = outL[r - lat]; R[i] = outR[r - lat];
+      this.rover = r + 1;
+      if (this.rover >= N) { this.rover = lat; this._frame(frame); this.frameCount++; }
     }
   }
-  _frame(c, frame) {
-    const N = this.N, hop = this.hop, re = this.re, im = this.im, w = this.win, inF = this.inF[c], acc = this.acc[c], outF = this.outF[c];
-    for (let k = 0; k < N; k++) { re[k] = inF[k] * w[k]; im[k] = 0; }
+  // Both channels share one complex FFT (x = left + i·right); the callback still sees
+  // separate per-channel half spectra.
+  _frame(frame) {
+    const N = this.N, H = N >> 1, hop = this.hop, m = N - 1, re = this.re, im = this.im, w = this.win;
+    const inL = this.inF[0], inR = this.inF[1];
+    if (!this.cre) { this.cre = [new Float32Array(N), new Float32Array(N)]; this.cim = [new Float32Array(N), new Float32Array(N)]; }
+    const lr = this.cre[0], li = this.cim[0], rr = this.cre[1], ri = this.cim[1];
+    for (let k = 0; k < N; k++) { re[k] = inL[k] * w[k]; im[k] = inR[k] * w[k]; }
     this.fft.forward(re, im);
-    frame(re, im, c, N);
-    im[0] = 0; im[N / 2] = 0;
-    for (let k = 1; k < N / 2; k++) { re[N - k] = re[k]; im[N - k] = -im[k]; }
+    for (let k = 0; k <= H; k++) {
+      const kk = (N - k) & m, xr = re[k], xi = im[k], yr = re[kk], yi = im[kk];
+      lr[k] = (xr + yr) * 0.5; li[k] = (xi - yi) * 0.5;
+      rr[k] = (xi + yi) * 0.5; ri[k] = (yr - xr) * 0.5;
+    }
+    frame(lr, li, 0, N);
+    frame(rr, ri, 1, N);
+    li[0] = li[H] = ri[0] = ri[H] = 0;
+    re[0] = lr[0] - ri[0]; im[0] = li[0] + rr[0];
+    re[H] = lr[H] - ri[H]; im[H] = li[H] + rr[H];
+    for (let k = 1; k < H; k++) {
+      const a = lr[k], b = li[k], c = rr[k], d = ri[k];
+      re[k] = a - d; im[k] = b + c;              // L + i·R
+      re[N - k] = a + d; im[N - k] = c - b;      // conj(L) + i·conj(R)
+    }
     this.fft.inverse(re, im);
-    const g = this.norm;
-    for (let k = 0; k < N; k++) acc[k] += re[k] * w[k] * g;
-    for (let k = 0; k < hop; k++) outF[k] = acc[k];
-    acc.copyWithin(0, hop, N * 2); acc.fill(0, N * 2 - hop);
-    inF.copyWithin(0, hop, N);
+    const g = this.norm, accL = this.acc[0], accR = this.acc[1], outL = this.outF[0], outR = this.outF[1];
+    for (let k = 0; k < N; k++) { const ww = w[k] * g; accL[k] += re[k] * ww; accR[k] += im[k] * ww; }
+    for (let k = 0; k < hop; k++) { outL[k] = accL[k]; outR[k] = accR[k]; }
+    accL.copyWithin(0, hop, N * 2); accL.fill(0, N * 2 - hop);
+    accR.copyWithin(0, hop, N * 2); accR.fill(0, N * 2 - hop);
+    inL.copyWithin(0, hop, N); inR.copyWithin(0, hop, N);
   }
 }
 const princArg = (p) => p - TAU * Math.round(p / TAU);
