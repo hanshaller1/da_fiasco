@@ -304,7 +304,7 @@
       if (k[0] !== sm || k[1] !== tl || k[2] !== fb || k[3] !== this.N) {
         k[0] = sm; k[1] = tl; k[2] = fb; k[3] = this.N;
         const st = this.st, u = st.t.u, B = this.B, hop = this.hop, sr = this.sr;
-        const tau = 0.002 + 3.5 * sm * sm, tauF = 2 * fb / (1.02 - fb);
+        const tau = 3.5 * sm * sm, tauF = 2 * fb / (1.02 - fb);
         for (let i = 0; i < B; i++) {
           const tk = tau * Math.pow(4, tl * u[i]);
           st.aA[i] = SPX_coef(tk, hop, sr);
@@ -931,12 +931,12 @@
       const np = pv.analyze(re, im, ch, 1e-6);
       let ein = 0; const pw = pv.pw;
       for (let k = 0; k < B; k++) ein += pw[k];
-      const binHz = this.sr / this.N, nyq = this.sr * 0.49;
+      const binHz = this.sr / this.N, nyq = this.sr * 0.495;
       for (let i = 0; i < np; i++) {
         const hz = pv.fq[i] * binHz;
         if (hz < 8) { pv.tg[i] = 0; pv.gn[i] = 1; continue; }
         const t = this.map(hz);
-        if (t < 15 || t > nyq) { pv.tg[i] = 0; pv.gn[i] = 0; }
+        if ((t < 15 && t < hz) || (t > nyq && t > hz * 1.0001)) { pv.tg[i] = 0; pv.gn[i] = 0; }
         else { pv.tg[i] = Math.log2(t / hz); pv.gn[i] = 1; }
       }
       pv.render(re, im, ch, this.gl, 0);
@@ -968,7 +968,7 @@
     ];
     setup() {
       this.cM = new Float64Array(3).fill(NaN); this.step = NaN; this.cap = false;
-      this.mx = new Float32Array(2); this.pSt = new Float64Array(2); this.roDirty = new Uint8Array(2); this.remap = false;
+      this.mx = new Float32Array(2); this.pSt = new Float64Array(2); this.pAvg = new Float64Array(2); this.roDirty = new Uint8Array(2); this.remap = false;
     }
     alloc(N) {
       const B = N / 2 + 1, F = () => new Float32Array(B), F2 = () => [F(), F()];
@@ -982,10 +982,11 @@
         X: F(), C: F(), src: F(), rat: F(), sel: new Uint8Array(B), pk: new Int32Array(B),
       };
     }
-    onClear() { this.step = NaN; this.cap = false; this.mx.fill(1); this.pSt.fill(0); this.cM[0] = NaN; this.roDirty.fill(1); }
+    onClear() { this.step = NaN; this.cap = false; this.mx.fill(1); this.pSt.fill(0); this.pAvg.fill(0); this.cM[0] = NaN; this.roDirty.fill(1); }
     block(p, ctx) {
       this.slice = Math.max(1 / 64, p.slice);
       this.blur = p.blur / 100; this.V = SPX_VOICES[clamp(p.voices | 0, 0, 13)];
+      this.avgC = SPX_coef(0.3, this.hop, this.sr);
       this.fb = p.fdbk / 100; this.mi = p.mixin / 100 * 0.3;
       const sliceFr = this.slice * ctx.spb / this.hop;
       this.mstep = 1 / Math.max(1, (p.morph / 100) * sliceFr);
@@ -1002,13 +1003,18 @@
       }
     }
     // per-output-bin rotation for the remapped resynthesis (only after a capture or remap change)
+    // and re-seed output phasors from the source phase with the (-1)^k lobe pattern of a
+    // frame-start-referenced Hann window, so moved partials stay coherent sinusoids.
     buildRot(ch) {
       const st = this.st, B = this.B, src = st.src, rat = st.rat, Wa = st.Wa[ch], Or = st.Or[ch], Oi = st.Oi[ch];
+      const Ur = st.Ur[ch], Ui = st.Ui[ch], Qr = st.Qr[ch], Qi = st.Qi[ch];
       for (let j = 0; j < B; j++) {
         const s = src[j];
         if (s < 0 || s >= B - 1) { Or[j] = 1; Oi[j] = 0; continue; }
         const i = s | 0, f = s - i, a = (Wa[i] + (Wa[i + 1] - Wa[i]) * f) * rat[j];
         Or[j] = Math.cos(a); Oi[j] = Math.sin(a);
+        const ic = f < 0.5 ? i : i + 1, sg = ((j - ic) & 1) ? -1 : 1;
+        Qr[j] = Ur[ic] * sg; Qi[j] = Ui[ic] * sg;
       }
       this.roDirty[ch] = 0;
     }
@@ -1048,7 +1054,8 @@
         const sel = st.sel;
         for (let k = 2; k < B - 2; k++) if (sel[k] === 2) for (let j = k - 2; j <= k + 2; j++) if (j !== k && C[j] >= fb * Mo[j]) { Wa[j] = Wa[k]; Rr[j] = Rr[k]; Ri[j] = Ri[k]; }
       }
-      const tgt = Math.max(Pc, fb * Po);
+      // a frozen transient must not outshine the music it came from: cap at 2x recent input power
+      const tgt = Math.min(Math.max(Pc, fb * Po), Math.max(2 * this.pAvg[ch], 1e-12));
       if (Pt > tgt && Pt > 0) { const sc = Math.sqrt(tgt / Pt); for (let k = 0; k < B; k++) St[k] *= sc; Pt = tgt; }
       this.pSt[ch] = Pt;
       Ms.set(Mo); this.mx[ch] = 0; this.roDirty[ch] = 1;
@@ -1057,6 +1064,8 @@
       const st = this.st, B = this.B, X = st.X, rng = this.rng, RT = SPX_RT;
       let pl = 0;
       for (let k = 0; k < B; k++) { const v = re[k] * re[k] + im[k] * im[k]; X[k] = Math.sqrt(v); pl += v; }
+      // recent input power (~0.3 s average)
+      this.pAvg[ch] += (pl - this.pAvg[ch]) * this.avgC;
       if (ch === 0) {
         const step = Math.floor(this.framePPQ() / this.slice);
         this.cap = step !== this.step; this.step = step;
@@ -1216,7 +1225,8 @@
     onClear() { this.mode = 0; this.newPkt = true; this.fcnt = 0; this.lost = 0; this.rpG = 1; }
     block(p) {
       const kb = p.bitrate;
-      this.bits = kb * 1000 * this.hop / this.sr * 0.5 * 3;
+      this.bits = kb * 1000 * this.hop / this.sr * 0.5 * (1.2 + 5 * kb / 256);
+      this.dz = 0.28 - 0.2 * kb / 256;
       const bw = Math.min(clamp(1500 * Math.sqrt(kb), 3000, 20000), 1500 * Math.pow(2, 3.7 * p.tone / 100));
       this.kbw = Math.min(this.B - 1, Math.round(bw * this.N / this.sr));
       this.loss = p.packet / 100; this.rep = p.repeat / 100; this.art = p.artfct / 100;
@@ -1260,7 +1270,7 @@
           const W = Math.pow(2, hi);
           for (let b = 0; b < SPX_NB; b++) bW[b] = W * slope[b];
         } else bW.fill(1e30);
-        const art = this.art, dz = 0.2, sp = art * 0.45;
+        const art = this.art, dz = this.dz, sp = art * 0.45;
         for (let k = 1; k < kb; k++) {
           const b = band[k], w = bW[b], rms = bE[b];
           if (rms <= w) { // dropped band: optional noise substitution

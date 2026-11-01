@@ -32,12 +32,7 @@
     const w = TAU * clamp(f, 5, sr * 0.49) / sr, c = Math.cos(w), al = Math.sin(w) / (2 * q), A = Math.pow(10, db / 40);
     bq._set(1 + al * A, -2 * c, 1 - al * A, 1 + al / A, -2 * c, 1 - al / A);
   }
-  function DRV_bqHS(bq, f, db, sr) { // high shelf, slope 1
-    const w = TAU * clamp(f, 5, sr * 0.49) / sr, c = Math.cos(w), A = Math.pow(10, db / 40);
-    const sa = 2 * Math.sqrt(A) * (Math.sin(w) * 0.5 * Math.SQRT2);
-    bq._set(A * ((A + 1) + (A - 1) * c + sa), -2 * A * ((A - 1) + (A + 1) * c), A * ((A + 1) + (A - 1) * c - sa),
-      (A + 1) - (A - 1) * c + sa, 2 * ((A - 1) - (A + 1) * c), (A + 1) - (A - 1) * c - sa);
-  }
+
 
   // ---------------------------------------------------------------------------
   // 2x oversampler: polyphase IIR halfband (6 allpass coefs, elliptic design,
@@ -189,6 +184,7 @@
       const sr = this.sr, rng = this.rng, model = p.model | 0;
       const bits = clamp(p.bits, 1, 16), Lv = Math.pow(2, bits - 1), step = 1 / Lv;
       const gT = dbToGain(p.drive), g0 = this.g < 0 ? gT : this.g, dg = (gT - g0) / n; this.g = gT;
+      const m0 = Math.pow(g0, -0.6), dm = (Math.pow(gT, -0.6) - m0) / n; // make-up for the drive
       const inc = p.sync ? 1 / Math.max(1, p.div * ctx.spb) : p.rate / sr;
       const dith = p.dither * 0.01 * step, jit = p.jitter * 0.009, sm = p.smooth * 0.01, useSm = sm > 0.004;
       const maxC = Math.max(1, Math.floor(Lv) - 1), hiC = maxC * 0.74, loC = maxC * 0.26;
@@ -247,7 +243,7 @@
           let y = model === 4 ? hp + (h - hp) * ph : h; // GLIDE = first-order hold
           const f = svf.process(y);
           if (useSm) y = f;
-          X[i] = y * (g > 1 ? 1 / Math.pow(g, 0.6) : 1);
+          X[i] = y * (m0 + dm * (i + 1));
         }
         s.ph = ph; s.h = h; s.hp = hp; s.jm = jm; s.ds = ds; s.dd = dd; s.e1 = e1; s.e2 = e2;
       }
@@ -568,9 +564,9 @@
           return t * (1.5 - 0.5 * t * t) * (1 - s) + t * s;
         }
         case 2: return fastTanh(this.k * Math.sin(DRV_HPI * u)) * this.kn; // SERGE: sine -> squarish folds
-        case 3: { // WRAP: modulo wrap, soft (sine-like) -> hard (saw)
-          const w = u - 2 * Math.floor((u + 1) * 0.5), a = w < 0 ? -w : w;
-          return w * (1 - Math.pow(a, this.P)) * this.wn;
+        case 3: { // WRAP: modulo wrap; the wrap edge is tapered, wide (soft) -> razor (hard)
+          const w = u - 2 * Math.floor((u + 1) * 0.5), e = (1 - (w < 0 ? -w : w)) * this.ie;
+          return (e < 1 ? w * e : w) * this.wn;
         }
         case 4: return Math.sin(DRV_HPI * u + s * 1.5 * Math.sin(Math.PI * u)); // SINE: self-modulated fold
         default: { const t = DRV_tri(u); return Math.sin(DRV_HPI * u) + (t - Math.sin(DRV_HPI * u)) * s; } // FOLD: sine -> triangle
@@ -582,8 +578,7 @@
       const fT = p.folds, f0 = this.fo < 0 ? fT : this.fo, df = (fT - f0) / n; this.fo = fT;
       this.m = p.model | 0; this.s = p.shape * 0.01;
       this.k = 1 + 5 * this.s; this.kn = 1 / fastTanh(this.k);
-      this.P = 2 + 38 * this.s * this.s;
-      this.wn = 1 / (Math.pow(1 / (this.P + 1), 1 / this.P) * this.P / (this.P + 1));
+      const eps = 0.6 - 0.58 * this.s; this.ie = 1 / eps; this.wn = 1 / (1 - eps);
       const bias = p.bias * 0.01, off = this._f(bias);
       lv.begin(n);
       const lg0 = lv.g0, ldg = lv.dg;
@@ -616,7 +611,7 @@
     static desc = 'Aural exciter: adds dynamic harmonics above TONE and saturated low harmonics in parallel with the dry signal.';
     static latency = 0;
     static params = [
-      { id: 'amount', label: 'AMOUNT', min: 0, max: 100, def: 45, unit: '%' },
+      { id: 'amount', label: 'AMOUNT', min: 0, max: 100, def: 55, unit: '%' },
       { id: 'drive', label: 'DRIVE', min: 0, max: 100, def: 50, unit: '%' },
       { id: 'tone', label: 'TONE', min: 700, max: 12000, def: 3000, unit: 'Hz', curve: 'exp' },
       { id: 'sub', label: 'SUB', min: 0, max: 100, def: 25, unit: '%' },
@@ -635,7 +630,6 @@
     process(L, R, n, p) {
       const sr = this.sr;
       const amt = p.amount * 0.012, k = 1 + p.drive * 0.06, col = p.color * 0.01, sub = p.sub * 0.01;
-      const comp = 1 / (1 + p.amount * 0.0025 + sub * 0.25);
       for (let c = 0; c < 2; c++) {
         const X = c ? R : L, s = this.ch[c], h1 = s.h1, h2 = s.h2, l1 = s.l1, l2 = s.l2, ef = s.env;
         h1.set(p.tone, DRV_Q, sr); h2.set(p.tone * 0.8, DRV_Q, sr); ef.set(p.attack, p.release);
@@ -649,7 +643,7 @@
           const exc = h2.hp * e;
           const lo = l1.process(x);
           const sh = l2.process(fastTanh(lo * 3));
-          X[i] = (x + amt * exc + sub * (0.6 * sh - 0.3 * lo)) * comp;
+          X[i] = x + amt * exc + sub * (0.6 * sh - 0.3 * lo);
         }
       }
     }
@@ -686,7 +680,7 @@
     process(L, R, n, p, ctx) {
       const sr = this.sr, rng = this.rng, r = p.regen;
       const kB = 1 + p.bite * 0.05, ikB = 1 / kB, outG = Math.sqrt(kB) * 0.9;
-      const cpl = p.couple * 0.01, cross = cpl * 0.5, damp = p.damp * 0.01, drift = p.drift * 0.01, col = p.color * 0.01;
+      const cpl = p.couple * 0.01, cross = cpl > 0.15 ? 0.12 * ((cpl - 0.15) / 0.85) * ((cpl - 0.15) / 0.85) : 0, damp = p.damp * 0.01, drift = p.drift * 0.01, col = p.color * 0.01;
       const envA = DRV_coef(2, sr), envR = DRV_coef(150, sr);
       for (let c = 0; c < 2; c++) {
         const s = this.ch[c];
@@ -696,16 +690,18 @@
         let m = 33 + (p.note | 0) + (c ? 7 * Math.min(1, cpl * 6.67) : 0);
         if (p.snap) m = ctx.key.snapMidi(m);
         const f = mtof(m + drift * 0.35 * s.dr);
-        const fc = Math.min(sr * 0.45, f * (1.2 + 40 * col * col)), fh = f * 0.3;
+        const fc = Math.min(sr * 0.45, f * (1.2 + 40 * col * col)), fh = f * 0.15;
         s.lp.set(fc, sr); s.hp.set(fh, sr);
-        const ratio = f / fc, hl = 1 / Math.sqrt(1 + ratio * ratio);
+        // loop-filter gain at the fundamental (normalised away) and at the 2nd harmonic
+        const ratio = f / fc, hl = 1 / Math.sqrt(1 + ratio * ratio) * 0.98894; // 0.98894 = HP gain at f
+        const h2 = 1 / Math.sqrt(1 + 4 * ratio * ratio) * 0.99720 / hl;
         // compensate the loop filters' phase so the loop sits on pitch
         const D = sr / f * (1 - Math.atan(ratio) / TAU + Math.atan(fh / f) / TAU);
         if (this.first) s.d.snap(D); else s.d.set(D);
         let fb;
         if (r <= 70) fb = Math.pow(10, -3 / (0.05 * Math.pow(80, r / 70) * f)); // T60 50 ms .. 4 s
         else fb = 1 + (r - 70) / 30 * 0.15; // self-oscillation, bounded by the loop saturator
-        s.fb = Math.min(1.6, fb / hl);
+        s.fb = r <= 70 ? Math.min(fb / hl, 0.9995 / ((h2 > 1 ? h2 : 1) * (1 + cross))) : Math.min(1.6, fb / hl);
         const fq = Math.min(0.99, fb);
         s.exc = Math.sqrt(Math.max(0.02, 1 - fq * fq));
       }
@@ -721,8 +717,8 @@
         let yl = sL.dl.read(sL.d.next() - 1), yr = sR.dl.read(sR.d.next() - 1);
         yl = fastTanh(sL.hp.hp(sL.lp.lp(yl)) * kB) * ikB;
         yr = fastTanh(sR.hp.hp(sR.lp.lp(yr)) * kB) * ikB;
-        sL.dl.write(xl * sL.exc + sL.fb * duckFb * (yl + (yr - yl) * cross));
-        sR.dl.write(xr * sR.exc + sR.fb * duckFb * (yr + (yl - yr) * cross));
+        sL.dl.write(xl * sL.exc + sL.fb * duckFb * (yl + yr * cross));
+        sR.dl.write(xr * sR.exc + sR.fb * duckFb * (yr + yl * cross));
         const ol = yl * outG, or = yr * outG, g = (lg0 + ldg * (i + 1)) * duckOut;
         si += xl * xl + xr * xr; so += ol * ol + or * or;
         L[i] = fastTanh(ol * g);
@@ -764,12 +760,13 @@
     init() {
       const sr = this.sr;
       this.ch = [0, 1].map(() => ({
-        pre: new Biquad(), de: new Biquad(), bump: new Biquad(), lp: new Biquad(), ns: 0x1234567, hp: new OnePole(), nh: new OnePole(), dl: new OnePole(),
+        bump: new Biquad(), lp: new Biquad(), ns: 0x1234567, zA: 0, zB: 0, zH: 0, zN: 0, zD: 0,
         os: new DRV_OS2(), line: new DelayLine(Math.ceil(sr * 0.012) + 8), M: 0, base: -1, dPrev: -1, wr: 0, wrT: 0, fr: 0, frT: 0,
         dropT: 0, dropLen: 1, dropDepth: 0, nextDrop: 1e12, rateUsed: 0,
       }));
-      for (const s of this.ch) { s.nh.set(700, sr); s.dl.set(1500, sr); }
-      this.lv = new DRV_Level(sr, 400, 0.1, 4.5);
+      const tg = (f) => { const t = Math.tan(Math.PI * Math.min(f, sr * 0.45) / sr); return t / (1 + t); }; // TPT one-pole coef
+      this.tg = tg; this.gN = tg(700); this.gD = tg(1500); this.gA = tg(2500); this.gB = tg(2500); this.aE = 1; this.gH = tg(12);
+      this.lv = new DRV_Level(sr, 400, 0.1, 6);
       this.rng = new Rng(0x7a9e);
       this.wph = 0; this.fph = 0; this.fph2 = 0.3; this.g = -1;
       this.key = ''; // cached EQ settings
@@ -785,11 +782,9 @@
       const eqKey = mode * 1e9 + Math.round(p.bass * 10) * 1e5 + Math.round(fcLP) + age * 0.5;
       if (eqKey !== this.key) {
         this.key = eqKey;
-        for (const s of this.ch) {
-          DRV_bqHS(s.pre, 2500, OX_EMPH[mode], sr); DRV_bqHS(s.de, 2500, -OX_EMPH[mode], sr);
-          DRV_bqPeak(s.bump, 72, 1.2, p.bass * 0.07, sr);
-          DRV_bqLP(s.lp, fcLP, 0.62, sr); s.hp.set(12 + age * 110, sr);
-        }
+        // first-order pre-emphasis shelf (+E dB above 2.5 kHz) and its exact inverse
+        this.aE = dbToGain(OX_EMPH[mode]) - 1; this.gB = this.tg(2500 / (1 + this.aE)); this.gH = this.tg(12 + age * 110);
+        for (const s of this.ch) { DRV_bqPeak(s.bump, 72, 1.2, p.bass * 0.07, sr); DRV_bqLP(s.lp, fcLP, 0.62, sr); }
       }
       // wow & flutter (block-rate LFOs, interpolated)
       const wowA = Math.min(1.3, p.wow * 0.01 + age * 0.3), flA = Math.min(1.3, p.flutter * 0.01 + age * 0.2);
@@ -824,26 +819,38 @@
       }
       lv.end(n);
     }
+    _drop(s, c, i) { // start an oxide dropout (and maybe mirror it on the right channel)
+      const rng = this.rng;
+      if (s.nextDrop <= 0) s.nextDrop = this.dRate > 0 ? -Math.log(1 - rng.next()) / this.dRate : 1e12;
+      s.dropLen = Math.round((0.015 + 0.1 * rng.next()) * this.sr); s.dropT = s.dropLen; s.dropDepth = 0.4 + 0.55 * rng.next();
+      if (c === 0 && rng.next() > this.width) this.linkI = i;
+    }
     _chan(X, s, c, n, g0, dg, bias, sa, sh, off, cRel, lg0, ldg, hiss) {
-      const sr = this.sr, rng = this.rng, lv = this.lv, dStart = this.dStart, dd = this.dd, dRate = this.dRate, width = this.width;
+      const lv = this.lv, dStart = this.dStart, dd = this.dd;
+      const gA = this.gA, gB = this.gB, aE = this.aE, iE = 1 / (1 + aE), gH = this.gH, gN = this.gN, gD = this.gD;
       {
-        const pre = s.pre, de = s.de, os = s.os, bump = s.bump, lp = s.lp, hp = s.hp, nh = s.nh, dlp = s.dl, line = s.line;
-        const lb = line.buf, lm = line.mask;
-        let M = s.M, si = 0, so = 0, ns = s.ns;
+        const os = s.os, bump = s.bump, lp = s.lp, line = s.line, lb = line.buf, lm = line.mask;
+        let M = s.M, si = 0, so = 0, ns = s.ns, zA = s.zA, zB = s.zB, zH = s.zH, zN = s.zN, zD = s.zD, v, u;
         for (let i = 0; i < n; i++) {
-          const x = X[i];
-          os.up(pre.process(x * (g0 + dg * (i + 1))));
+          const x = X[i], xd = x * (g0 + dg * (i + 1));
+          v = (xd - zA) * gA; u = v + zA; zA = u + v; // pre-emphasis: x + a*HP(x)
+          os.up(xd + aE * (xd - u));
           // saturation with direction-dependent relaxation (hysteresis)
           let T = OX_sat(os.a + bias, sa, sh) - off;
           if (T * M >= 0 && (T < 0 ? -T : T) > (M < 0 ? -M : M)) M = T; else M += (T - M) * cRel;
           const ya = M;
           T = OX_sat(os.b + bias, sa, sh) - off;
           if (T * M >= 0 && (T < 0 ? -T : T) > (M < 0 ? -M : M)) M = T; else M += (T - M) * cRel;
-          let y = de.process(os.down(ya, M));
+          let y = os.down(ya, M);
+          v = (y - zB) * gB; u = v + zB; zB = u + v; y = u + (y - u) * iE; // de-emphasis
           si += x * x; so += y * y;
           y = bump.process(y * (lg0 + ldg * (i + 1)));
-          if (hiss > 0) { ns = (Math.imul(ns, 1664525) + 1013904223) | 0; y += nh.hp(ns * 4.656612873e-10) * hiss; }
-          y = hp.hp(lp.process(y));
+          if (hiss > 0) { // bright tape hiss
+            ns = (Math.imul(ns, 1664525) + 1013904223) | 0;
+            const w = ns * 4.656612873e-10; v = (w - zN) * gN; u = v + zN; zN = u + v; y += (w - u) * hiss;
+          }
+          y = lp.process(y);
+          v = (y - zH) * gH; u = v + zH; zH = u + v; y -= u; // rumble / generation low cut
           line.write(y);
           { // hermite read, delay >= 3 samples
             const pos = line.w - 1 - (dStart + dd * (i + 1)), ip = Math.floor(pos), f = pos - ip;
@@ -854,20 +861,13 @@
           // oxide dropouts
           if (s.dropT > 0) {
             const t = s.dropT / s.dropLen, q = 4 * t * (1 - t), k = s.dropDepth * q * q;
-            y = (y + (dlp.lp(y) - y) * k * 0.6) * (1 - k);
+            v = (y - zD) * gD; u = v + zD; zD = u + v;
+            y = (y + (u - y) * k * 0.6) * (1 - k);
             s.dropT--;
-          } else {
-            let start = false;
-            if (--s.nextDrop <= 0) { start = true; s.nextDrop = dRate > 0 ? -Math.log(1 - rng.next()) / dRate : 1e12; }
-            if (c === 1 && i === this.linkI) start = true;
-            if (start) {
-              s.dropLen = Math.round((0.015 + 0.1 * rng.next()) * sr); s.dropT = s.dropLen; s.dropDepth = 0.4 + 0.55 * rng.next(); dlp.s = y;
-              if (c === 0 && rng.next() > width) this.linkI = i;
-            }
-          }
+          } else if (--s.nextDrop <= 0 || (c === 1 && i === this.linkI)) { this._drop(s, c, i); zD = y; }
           X[i] = y;
         }
-        s.M = M; s.ns = ns;
+        s.M = M; s.ns = ns; s.zA = zA; s.zB = zB; s.zH = zH; s.zN = zN; s.zD = zD;
         lv.si += si; lv.so += so;
       }
     }
@@ -952,13 +952,18 @@
       this.W = Math.round(0.06 * sr); this.pre = Math.round(0.05 * sr);
       this.ch = [0, 1].map((c) => ({ dl: new DelayLine(this.W + this.pre + 16), ph: c * 0.25, fb: 0, lp: new OnePole(), hp: new OnePole(), dc: new DCBlock(0.999) }));
       this.lv = new DRV_Level(sr, 400, 0.1, 2);
-      this.gF = -1;
+      this.gF = -1; this.sT = NaN; this.sRoot = -1; this.sIv = null; this.sV = 0;
     }
     process(L, R, n, p, ctx) {
       const sr = this.sr, lv = this.lv, W = this.W, pre = this.pre;
       const fold = p.fold * 0.01, gT = 1 + 7 * fold * fold, g0 = this.gF < 0 ? gT : this.gF, dg = (gT - g0) / n; this.gF = gT;
       const sh = p.shape * 0.01, fbk = p.fdbk * 0.0092;
-      const semis = p.snap ? ctx.key.snapSemis(p.trail) : p.trail;
+      let semis = p.trail;
+      if (p.snap) { // lib snapSemis allocates: only recompute when trail or key change
+        const k = ctx.key;
+        if (p.trail !== this.sT || k.root !== this.sRoot || k.intervals !== this.sIv) { this.sT = p.trail; this.sRoot = k.root; this.sIv = k.intervals; this.sV = k.snapSemis(p.trail); }
+        semis = this.sV;
+      }
       const dph = (1 - Math.pow(2, semis / 12)) / W;
       lv.begin(n);
       const lg0 = lv.g0, ldg = lv.dg;
@@ -1012,50 +1017,43 @@
     init() {
       this.xl = new DRV_XO(); this.xr = new DRV_XO();
       this.env = new Float64Array(3); this.ca = new Float64Array(3); this.cr = new Float64Array(3);
+      this.gc = new Float64Array([1, 1, 1]); this.gs = new Float64Array(3);
       this.gi = -1; this.go = -1;
     }
+    // band gain (linear) from its envelope; thresholds sit lower for higher bands
+    _gain(e, b) {
+      const lv = DRV_DB * Math.log(e + 1e-9), o = 2 * b;
+      return Math.exp((this.depth * (DRV_down(lv, -20 - o, this.Rd, 6) + DRV_up(lv, -40 - o, this.Ru, 18, -62 - o)) + this.mk) * DRV_LN);
+    }
     process(L, R, n, p) {
-      const sr = this.sr, nb = (p.bands | 0) + 1, env = this.env, ca = this.ca, cr = this.cr;
-      const depth = p.depth * 0.01, up = p.upward * 0.01, dn = p.downward * 0.01;
-      const Rd = 1 + 9 * dn, Ru = 1 + 3 * up, mk = depth * 8;
+      const sr = this.sr, nb = (p.bands | 0) + 1, env = this.env, ca = this.ca, cr = this.cr, gc = this.gc, gs = this.gs;
+      this.depth = p.depth * 0.01; this.Rd = 1 + 9 * p.downward * 0.01; this.Ru = 1 + 3 * p.upward * 0.01; this.mk = this.depth * 8;
       const tf = 0.1 * Math.pow(100, p.time * 0.01);
       for (let b = 0; b < 3; b++) { ca[b] = DRV_coef(SQ_ATT[b] * tf, sr); cr[b] = DRV_coef(SQ_REL[b] * tf, sr); }
       if (nb > 1) { this.xl.set(p.lox, p.hix, sr); this.xr.set(p.lox, p.hix, sr); }
       const giT = dbToGain(p.input), gi0 = this.gi < 0 ? giT : this.gi, dgi = (giT - gi0) / n; this.gi = giT;
       const goT = dbToGain(p.output), go0 = this.go < 0 ? goT : this.go, dgo = (goT - go0) / n; this.go = goT;
-      const xl = this.xl, xr = this.xr;
-      let e0 = env[0], e1 = env[1], e2 = env[2];
+      const xl = this.xl, xr = this.xr, ca0 = ca[0], ca1 = ca[1], ca2 = ca[2], cr0 = cr[0], cr1 = cr[1], cr2 = cr[2];
+      let e0 = env[0], e1 = env[1], e2 = env[2], g0 = gc[0], g1 = gc[1], g2 = gc[2], s0 = gs[0], s1 = gs[1], s2 = gs[2];
       for (let i = 0; i < n; i++) {
         const gi = gi0 + dgi * (i + 1), l = L[i] * gi, r = R[i] * gi;
-        let l0, r0, l1 = 0, r1 = 0, l2 = 0, r2 = 0;
-        if (nb === 1) { l0 = l; r0 = r; }
-        else if (nb === 2) { xl.split2(l); xr.split2(r); l0 = xl.lo; r0 = xr.lo; l1 = xl.hi; r1 = xr.hi; }
-        else { xl.split3(l); xr.split3(r); l0 = xl.lo; r0 = xr.lo; l1 = xl.mid; r1 = xr.mid; l2 = xl.hi; r2 = xr.hi; }
-        let d, g, a;
-        // band 0
-        a = l0 < 0 ? -l0 : l0; d = r0 < 0 ? -r0 : r0; if (a > d) d = a;
-        e0 += (d - e0) * (d > e0 ? ca[0] : cr[0]);
-        a = DRV_DB * Math.log(e0 + 1e-9);
-        g = Math.exp((depth * (DRV_down(a, -20, Rd, 6) + DRV_up(a, -40, Ru, 18, -62)) + mk) * DRV_LN);
-        let ol = l0 * g, or = r0 * g;
-        if (nb > 1) {
-          a = l1 < 0 ? -l1 : l1; d = r1 < 0 ? -r1 : r1; if (a > d) d = a;
-          e1 += (d - e1) * (d > e1 ? ca[1] : cr[1]);
-          a = DRV_DB * Math.log(e1 + 1e-9);
-          g = Math.exp((depth * (DRV_down(a, -22, Rd, 6) + DRV_up(a, -42, Ru, 18, -64)) + mk) * DRV_LN);
-          ol += l1 * g; or += r1 * g;
+        let l0 = l, r0 = r, l1 = 0, r1 = 0, l2 = 0, r2 = 0, a, d;
+        if (nb === 2) { xl.split2(l); xr.split2(r); l0 = xl.lo; r0 = xr.lo; l1 = xl.hi; r1 = xr.hi; }
+        else if (nb === 3) { xl.split3(l); xr.split3(r); l0 = xl.lo; r0 = xr.lo; l1 = xl.mid; r1 = xr.mid; l2 = xl.hi; r2 = xr.hi; }
+        // stereo-linked peak envelopes per band
+        a = l0 < 0 ? -l0 : l0; d = r0 < 0 ? -r0 : r0; if (a > d) d = a; e0 += (d - e0) * (d > e0 ? ca0 : cr0);
+        a = l1 < 0 ? -l1 : l1; d = r1 < 0 ? -r1 : r1; if (a > d) d = a; e1 += (d - e1) * (d > e1 ? ca1 : cr1);
+        a = l2 < 0 ? -l2 : l2; d = r2 < 0 ? -r2 : r2; if (a > d) d = a; e2 += (d - e2) * (d > e2 ? ca2 : cr2);
+        if ((i & 3) === 0) { // gain computer at 1/4 rate, linear ramps in between
+          s0 = (this._gain(e0, 0) - g0) * 0.25;
+          if (nb > 1) s1 = (this._gain(e1, 1) - g1) * 0.25;
+          if (nb > 2) s2 = (this._gain(e2, 2) - g2) * 0.25;
         }
-        if (nb > 2) {
-          a = l2 < 0 ? -l2 : l2; d = r2 < 0 ? -r2 : r2; if (a > d) d = a;
-          e2 += (d - e2) * (d > e2 ? ca[2] : cr[2]);
-          a = DRV_DB * Math.log(e2 + 1e-9);
-          g = Math.exp((depth * (DRV_down(a, -24, Rd, 6) + DRV_up(a, -44, Ru, 18, -66)) + mk) * DRV_LN);
-          ol += l2 * g; or += r2 * g;
-        }
+        g0 += s0; g1 += s1; g2 += s2;
         const go = go0 + dgo * (i + 1);
-        L[i] = DRV_soft(ol * go); R[i] = DRV_soft(or * go);
+        L[i] = DRV_soft((l0 * g0 + l1 * g1 + l2 * g2) * go); R[i] = DRV_soft((r0 * g0 + r1 * g1 + r2 * g2) * go);
       }
-      env[0] = e0; env[1] = e1; env[2] = e2;
+      env[0] = e0; env[1] = e1; env[2] = e2; gc[0] = g0; gc[1] = g1; gc[2] = g2; gs[0] = s0; gs[1] = s1; gs[2] = s2;
     }
   });
 
