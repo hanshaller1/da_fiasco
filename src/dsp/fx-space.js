@@ -39,8 +39,6 @@ function SPC_safe(x) {
   const a = Math.abs(x), m = Math.min(a, 1.5) + 2.5 * fastTanh(Math.max(0, a - 1.5) * 0.4);
   return m * (x < 0 ? -1 : 1);
 }
-// drive-normalised saturator (unity small-signal gain, bounded by 1/d)
-function SPC_sat(x, d) { return fastTanh(x * d) / d; }
 // stereo "lean" matrix for l in [-1,1] written into arrays at index k
 // outL = xL*ll + xR*rl ; outR = xR*rr + xL*lr
 function SPC_lean(l, ll, rl, rr, lr, k) {
@@ -528,7 +526,7 @@ registerFX(class extends FX {
   init() {
     const sr = this.sr;
     this.Ks = Math.max(1, Math.round(sr / 9600));      // stretch factor
-    this.KM = 8;                                        // ring length per stage (>= Ks)
+    this.KM = this.Ks + 1;                              // ring length per stage (> Ks)
     this.xh = new Float32Array(2 * SPC_SP_M * this.KM); this.yh = new Float32Array(2 * SPC_SP_M * this.KM); this.j = 0;
     const N = SPC_pow2(Math.ceil(0.16 * sr));
     this.dl = SPC_f32(this, 'dl', N * 2); this.N = N; this.mask = N - 1; this.w = 0;
@@ -599,8 +597,8 @@ registerFX(class extends FX {
       hpA += cHp * (lpA - hpA); hpB += cHp * (lpB - hpB);
       fA = fastTanh((lpA - hpA) * gA * 1.2) * 0.8333; fB = fastTanh((lpB - hpB) * gB * 1.2) * 0.8333;
       w = (w + 1) & mask;
-      // output: dispersed signal, stereo width
-      const oA = sA * 0.7, oB = sB * 0.7, mid = (oA + oB) * 0.5, side = (oA - oB) * 0.5 * wid;
+      // output: the spring's far end (main tap + ripple), stereo width
+      const oA = tA * 1.1, oB = tB * 1.1, mid = (oA + oB) * 0.5, side = (oA - oB) * 0.5 * wid;
       L[i] = SPC_safe(mid + side); R[i] = SPC_safe(mid - side);
     }
     K[20] = d; this.j = j; this.w = w;
@@ -702,7 +700,7 @@ registerFX(class extends FX {
       yl = ll - hl; yr = lr - hr;
       const ay = Math.abs(yl) + Math.abs(yr);
       env += (ay - env) * (ay > env ? 0.01 : 0.0002);
-      const ol = fl + yl * layer * 0.5, or = fr + yr * layer * 0.5;
+      const ol = fl + yl * layer * 0.8, or = fr + yr * layer * 0.8;
       const mid = (ol + or) * 0.5, side = (ol - or) * 0.5 * wid;
       L[i] = SPC_safe(mid + side); R[i] = SPC_safe(mid - side);
       t = (t + 1) & 0x3fffffff;
@@ -779,8 +777,8 @@ registerFX(class extends FX {
       const fl = fdn.oL * 0.3, fr = fdn.oR * 0.3;
       bL[w] = fl; bR[w] = fr; w = (w + 1) & mask;
       gr.tick(bL, bR, mask);
-      L[i] = SPC_safe(fl * (1 - blend) + gr.oL * blend);
-      R[i] = SPC_safe(fr * (1 - blend) + gr.oR * blend);
+      L[i] = SPC_safe((fl * (1 - blend) + gr.oL * blend) * 1.4);
+      R[i] = SPC_safe((fr * (1 - blend) + gr.oR * blend) * 1.4);
     }
     this.w = w; this.xf = xf;
   }
@@ -918,7 +916,7 @@ registerFX(class extends FX {
     const N = SPC_pow2(Math.ceil(8 * sr));
     this.bL = SPC_f32(this, 'bL', N); this.bR = SPC_f32(this, 'bR', N); this.mask = N - 1; this.N = N; this.w = 0;
     this.gr = new SPC_Grains(24); this.rng = new Rng(0xc10d);
-    this.ev = new Int32Array(16); this.lastTick = -1; this.next = 0; this.frz = 0;
+    this.ev = new Int32Array(16); this.lastTick = -1; this.next = 0; this.frz = 0; this.extra = 0;
   }
   _spawn(p, ctx, len, ovl, at) {
     const rng = this.rng, sr = this.sr;
@@ -931,7 +929,6 @@ registerFX(class extends FX {
     const sp = p.spray * 0.01;
     let back = 32 + (!rev && ratio > 1 ? (ratio - 1) * len : 0) + sp * sp * rng.next() * 2 * sr;
     if (rng.chance(p.scramble * 0.01)) back += (1 + rng.int(8)) * len;
-    if (rev) back += 0; // reverse grains read backwards from the start point
     back = Math.min(back, this.N - len * (ratio + 1) - 64);
     const now = this.w + at;
     this.gr.spawn(now - back, rev ? -ratio : ratio, len, 1, rng.bi() * p.width * 0.01, 1.15 / Math.sqrt(Math.max(1, ovl * 0.7)));
@@ -942,11 +939,14 @@ registerFX(class extends FX {
     const len = clamp(p.sync ? p.size * spb : p.ms * 0.001 * sr, 64, 2 * sr);
     let ne = 0;
     if (p.sync) {
-      // onsets on the ppq grid: step = SIZE / round(overlap)
-      const step = p.size / Math.max(1, Math.round(ovl));
+      // onsets on the ppq grid: step = SIZE / 2^k (k from density); the fractional rest of the
+      // overlap becomes a chance of an extra grain on each tick
+      const q = Math.pow(2, Math.floor(Math.log2(ovl)));
+      const step = p.size / q;
+      this.extra = ovl / q - 1;
       const p0 = ctx.ppq, p1 = ctx.ppq + n / spb;
       let k = Math.floor(p0 / step);
-      if (this.lastTick < 0) this.lastTick = k - 1;
+      if (this.lastTick < 0 || k < this.lastTick - 1) this.lastTick = k - 1; // start / transport jumped back
       for (let j = k; j * step < p1 && ne < 16; j++) {
         if (j <= this.lastTick) continue;
         const at = Math.max(0, Math.min(n - 1, Math.round((j * step - p0) * spb)));
@@ -964,7 +964,7 @@ registerFX(class extends FX {
       if (at > i0) { this._dsp(L, R, i0, at); i0 = at; }
       this._spawn(p, ctx, len, ovl, 0);
       // density can ask for several grains per tick in sync mode when overlap is fractional
-      if (p.sync && this.rng.chance(ovl - Math.round(ovl) > 0 ? ovl - Math.round(ovl) : 0)) this._spawn(p, ctx, len, ovl, 0);
+      if (p.sync && this.rng.chance(this.extra)) this._spawn(p, ctx, len, ovl, 0);
     }
     if (i0 < n) this._dsp(L, R, i0, n);
   }
@@ -1094,7 +1094,7 @@ registerFX(class extends FX {
   static cat = 'RESONATOR';
   static desc = 'Struck modal resonator with 20 modes morphing from wood through metal to glass.';
   static params = [
-    { id: 'tune', label: 'TUNE', min: 24, max: 96, def: 45, curve: 'int', fmt: (v) => NOTE_NAMES[((Math.round(v) % 12) + 12) % 12] + (Math.floor(Math.round(v) / 12) - 1) },
+    { id: 'tune', label: 'TUNE', min: 24, max: 96, def: 45, curve: 'int' }, // MIDI note (45 = A2)
     { id: 'decay', label: 'DECAY', min: 0.05, max: 10, def: 1.2, unit: 's', curve: 'exp' },
     { id: 'material', label: 'MATERIAL', min: 0, max: 100, def: 45, unit: '%' },
     { id: 'position', label: 'POSITION', min: 0, max: 100, def: 30, unit: '%' },
@@ -1596,7 +1596,7 @@ registerFX(class extends FX {
       const a = bL[ql & mask], b = bR[qr & mask];
       const c = S[7];
       lpl += c * (a - lpl); lpr += c * (b - lpr);
-      L[i] = lpl * env * S[5]; R[i] = lpr * env * S[6];
+      L[i] = lpl * env * S[5] * 1.2; R[i] = lpr * env * S[6] * 1.2;
       t++;
     }
     this.t = t; st[0] = lpl; st[1] = lpr;
@@ -1616,7 +1616,7 @@ registerFX(class extends FX {
     { id: 'size', label: 'SIZE', min: 10, max: 1000, def: 120, unit: 'ms', curve: 'exp' },
     { id: 'pitch', label: 'PITCH', min: -24, max: 24, def: 0, curve: 'int', unit: 'st', bipolar: true },
     { id: 'capture', label: 'CAPTURE', toggle: true, def: 1 },
-    { id: 'transient', label: 'TRANSIENT', min: 0, max: 100, def: 0, unit: '%' },
+    { id: 'transient', label: 'TRANSIENT', min: 0, max: 100, def: 40, unit: '%' },
     { id: 'shape', label: 'SHAPE', min: 0, max: 100, def: 0, unit: '%' },
     { id: 'spray', label: 'SPRAY', min: 0, max: 100, def: 15, unit: '%' },
     { id: 'duck', label: 'DUCK', min: 0, max: 100, def: 0, unit: '%' },
@@ -1688,7 +1688,7 @@ registerFX(class extends FX {
       }
       denv += (ax - denv) * (ax > denv ? 0.02 : 0.0005);
       dg += ((1 - duck * Math.min(1, denv * 3)) - dg) * 0.003;
-      L[i] = SPC_safe(ol * norm * 0.75 * dg); R[i] = SPC_safe(or * norm * 0.75 * dg);
+      L[i] = SPC_safe(ol * norm * 0.55 * dg); R[i] = SPC_safe(or * norm * 0.55 * dg);
     }
     st[0] = ef; st[1] = es; st[2] = hold; st[3] = denv; st[4] = dg;
   }
@@ -1785,7 +1785,7 @@ registerFX(class extends FX {
           env *= Math.exp(-tl / V[4]);
           const q = Math.min(V[0] + tl * V[3], t - 1), j = Math.floor(q), f = q - j, j0 = j & mask, j1 = (j + 1) & mask;
           const a = bL[j0] + (bL[j1] - bL[j0]) * f, b = bR[j0] + (bR[j1] - bR[j0]) * f;
-          ol = a * env * V[5] * 1.41; or = b * env * V[6] * 1.41;
+          ol = a * env * V[5] * 1.05; or = b * env * V[6] * 1.05;
         }
       }
       L[i] = ol; R[i] = or;

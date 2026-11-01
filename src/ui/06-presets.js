@@ -12,7 +12,7 @@ function definePresets() {
   factory('TAPE LULL', 'TAPE', P_({
     'vari.on': 1, 'vari.speed': 64, 'vari.tempo': '1/1', 'vari.wow': 55, 'vari.sat': 35, 'vari.comp': 20, 'vari.mix': 100,
     ...fxp('oxide', { drive: 45, wow: 30, flutter: 25, noise: 20, age: 35, dull: 30 }),
-    ...fxp('echotape', { time_l: '1/4D', time_r: '1/4', fdbk: 45, age: 50, wobble: 35 }), 'fx.echotape.mix': 35,
+    ...fxp('echotape', { timel: '1/4D', timer: '1/4', fdbk: 45, age: 50, wobble: 35 }), 'fx.echotape.mix': 35,
     ...fxp('plate', { size: 70, decay: 60 }), 'fx.plate.mix': 25,
     ...lfo(1, { shape: 'SINE', rate: '4/1' }),
     'main.low': 2, 'main.high': -3,
