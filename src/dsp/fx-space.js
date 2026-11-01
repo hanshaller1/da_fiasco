@@ -782,3 +782,197 @@ registerFX(class extends FX {
   }
 });
 
+// ===========================================================================
+// 7. PITCH — grain pitch shifter / frequency shifter / ring modulator
+// ===========================================================================
+const SPC_HB_A = [0.6923878, 0.9360654322959, 0.9882295226860, 0.9987488452737].map((a) => a * a);
+const SPC_HB_B = [0.4021921162426, 0.8561710882420, 0.9722909545651, 0.9952884791278].map((a) => a * a);
+registerFX(class extends FX {
+  static id = 'pitch';
+  static label = 'PITCH';
+  static cat = 'PITCH';
+  static desc = 'Grain pitch shifter with stereo detune, delay/feedback cascades and tape-like spray; also frequency-shift and ring modes.';
+  static params = [
+    { id: 'semis', label: 'SEMIS', min: -24, max: 24, def: 12, curve: 'int', unit: 'st', bipolar: true },
+    { id: 'fine', label: 'FINE', min: -100, max: 100, def: 0, bipolar: true },
+    { id: 'mode', label: 'MODE', options: ['PITCH', 'FREQ', 'RING'], def: 0 },
+    { id: 'spread', label: 'SPREAD', min: 0, max: 50, def: 8 },
+    { id: 'delay', label: 'DELAY', min: 0, max: 1000, def: 0, unit: 'ms', curve: 'sq' },
+    { id: 'fdbk', label: 'FDBK', min: 0, max: 95, def: 0, unit: '%' },
+    { id: 'spray', label: 'SPRAY', min: 0, max: 100, def: 0, unit: '%' },
+    { id: 'window', label: 'WINDOW', min: 10, max: 200, def: 70, unit: 'ms', curve: 'exp' },
+    { id: 'snap', label: 'SNAP', toggle: true, def: 0 },
+    { id: 'tone', label: 'TONE', min: -100, max: 100, def: 0, bipolar: true },
+  ];
+  init() {
+    const sr = this.sr;
+    const N = SPC_pow2(Math.ceil(1.5 * sr));
+    this.bL = SPC_f32(this, 'bL', N); this.bR = SPC_f32(this, 'bR', N); this.mask = N - 1; this.w = 0;
+    this.shL = new SPC_Shifter(21); this.shR = new SPC_Shifter(22);
+    this.hb = new Float64Array(2 * 2 * 4 * 4); // [ch][branch][stage][x1,x2,y1,y2]
+    this.hbd = new Float64Array(2);             // one-sample delay for branch A
+    this.K = new Float64Array(24); this.st = new Float64Array(16); this.first = true;
+    this.rng = new Rng(0x91c4); this.wob = 0; this.wobT = 0;
+    this.cL = 1; this.sL = 0; this.cR = 1; this.sR = 0;
+  }
+  process(L, R, n, p, ctx) {
+    const sr = this.sr, K = this.K, mode = p.mode | 0;
+    let semis = p.semis;
+    if (p.snap) semis = ctx.key.snapSemis(semis);
+    const spray = p.spray * 0.01;
+    if (this.rng.next() < n / sr * (2 + 6 * spray)) this.wobT = this.rng.bi();
+    this.wob += (this.wobT - this.wob) * 0.04;
+    const cents = semis * 100 + p.fine + this.wob * spray * 35;
+    const winS = p.window * 0.001 * sr, dS = p.delay * 0.001 * sr;
+    if (this.first) { K[12] = dS; K[13] = winS; this.first = false; }
+    K[0] = mode;
+    K[1] = Math.pow(2, (cents - p.spread * 0.5) / 1200); K[2] = Math.pow(2, (cents + p.spread * 0.5) / 1200);
+    K[3] = (dS - K[12]) * 0.06 / n; K[4] = (winS - K[13]) * 0.1 / n;
+    K[5] = spray * 0.5; K[6] = p.fdbk * 0.01;
+    const tone = p.tone;
+    K[7] = 1 - Math.exp(-TAU * (tone < 0 ? 12000 * Math.pow(2, tone * 0.05) : 14000) / sr);
+    K[8] = 1 - Math.exp(-TAU * (tone > 0 ? 40 * Math.pow(2, tone * 0.06) : 30) / sr);
+    // frequency shift / ring carrier
+    let fL, fR;
+    if (mode === 1) { const hz = semis * 25 + p.fine * 0.25 + this.wob * spray * 6; fL = hz - p.spread * 0.2; fR = hz + p.spread * 0.2; }
+    else { let hz = 220 * Math.pow(2, (semis + p.fine * 0.01) / 12); if (p.snap) hz = ctx.key.snapHz(hz); fL = hz * Math.pow(2, -p.spread / 2400); fR = hz * Math.pow(2, p.spread / 2400); }
+    K[9] = TAU * fL / sr; K[10] = TAU * fR / sr;
+    // renormalise quadrature oscillators once per block
+    let m = 1 / Math.hypot(this.cL, this.sL); this.cL *= m; this.sL *= m;
+    m = 1 / Math.hypot(this.cR, this.sR); this.cR *= m; this.sR *= m;
+    this._dsp(L, R, n);
+  }
+  _dsp(L, R, n) {
+    const K = this.K, st = this.st, bL = this.bL, bR = this.bR, mask = this.mask, shL = this.shL, shR = this.shR;
+    const mode = K[0], rL = K[1], rR = K[2], dStep = K[3], wStep = K[4], jit = K[5], fb = K[6], cLp = K[7], cHp = K[8];
+    const wcl = Math.cos(K[9]), wsl = Math.sin(K[9]), wcr = Math.cos(K[10]), wsr = Math.sin(K[10]);
+    const hb = this.hb, A = SPC_HB_A, B = SPC_HB_B;
+    let dly = K[12], win = K[13], w = this.w, cL = this.cL, sL = this.sL, cR = this.cR, sR = this.sR;
+    let yl = st[0], yr = st[1], ll = st[2], lr = st[3], hl = st[4], hr = st[5], dA0 = this.hbd[0], dA1 = this.hbd[1];
+    for (let i = 0; i < n; i++) {
+      dly += dStep; win += wStep;
+      // feedback tone + soft clip, write history
+      ll += cLp * (yl - ll); lr += cLp * (yr - lr); hl += cHp * (ll - hl); hr += cHp * (lr - hr);
+      bL[w] = L[i] + fb * fastTanh(ll - hl); bR[w] = R[i] + fb * fastTanh(lr - hr);
+      if (mode === 0) {
+        shL.step(rL, win, jit * win); shR.step(rR, win, jit * win);
+        const b0 = w - 1 - dly;
+        yl = SPC_rd(bL, mask, b0 - shL.d0) * shL.g0 + SPC_rd(bL, mask, b0 - shL.d1) * shL.g1;
+        yr = SPC_rd(bR, mask, b0 - shR.d0) * shR.g0 + SPC_rd(bR, mask, b0 - shR.d1) * shR.g1;
+      } else {
+        const xl = dly < 1 ? bL[w] : SPC_rd(bL, mask, w - dly), xr = dly < 1 ? bR[w] : SPC_rd(bR, mask, w - dly);
+        // advance quadrature oscillators
+        let t = cL * wcl - sL * wsl; sL = sL * wcl + cL * wsl; cL = t;
+        t = cR * wcr - sR * wsr; sR = sR * wcr + cR * wsr; cR = t;
+        if (mode === 2) { yl = xl * sL; yr = xr * sR; }
+        else {
+          // Hilbert pair (two 4-stage allpass chains per channel)
+          let a = xl, b = xl, c = xr, d = xr;
+          for (let s = 0; s < 4; s++) {
+            let o = s * 4; let y = A[s] * (a + hb[o + 3]) - hb[o + 1]; hb[o + 1] = hb[o]; hb[o] = a; hb[o + 3] = hb[o + 2]; hb[o + 2] = y; a = y;
+            o = 16 + s * 4; y = B[s] * (b + hb[o + 3]) - hb[o + 1]; hb[o + 1] = hb[o]; hb[o] = b; hb[o + 3] = hb[o + 2]; hb[o + 2] = y; b = y;
+            o = 32 + s * 4; y = A[s] * (c + hb[o + 3]) - hb[o + 1]; hb[o + 1] = hb[o]; hb[o] = c; hb[o + 3] = hb[o + 2]; hb[o + 2] = y; c = y;
+            o = 48 + s * 4; y = B[s] * (d + hb[o + 3]) - hb[o + 1]; hb[o + 1] = hb[o]; hb[o] = d; hb[o + 3] = hb[o + 2]; hb[o + 2] = y; d = y;
+          }
+          const reL = dA0, reR = dA1; dA0 = a; dA1 = c;  // branch A delayed one sample
+          yl = reL * cL + b * sL; yr = reR * cR + d * sR;
+        }
+      }
+      w = (w + 1) & mask;
+      L[i] = SPC_safe(yl); R[i] = SPC_safe(yr);
+    }
+    this.w = w; this.cL = cL; this.sL = sL; this.cR = cR; this.sR = sR; this.hbd[0] = dA0; this.hbd[1] = dA1;
+    K[12] = dly; K[13] = win; st[0] = yl; st[1] = yr; st[2] = ll; st[3] = lr; st[4] = hl; st[5] = hr;
+  }
+});
+
+// ===========================================================================
+// 8. CLOUD — granular cloud from a rolling buffer
+// ===========================================================================
+const SPC_CLOUD_IV = [12, -12, 7, -5, 5, 19, -7, 24];
+registerFX(class extends FX {
+  static id = 'cloud';
+  static label = 'CLOUD';
+  static cat = 'GRANULAR';
+  static desc = 'Granular cloud: clocked grains that pitch, reverse, scatter, scramble and freeze the recent past.';
+  static params = [
+    { id: 'size', label: 'SIZE', div: ['1/2', '1/64'], def: '1/16' },
+    { id: 'density', label: 'DENSITY', min: 0, max: 100, def: 50, unit: '%' },
+    { id: 'pitch', label: 'PITCH', min: -24, max: 24, def: 0, curve: 'int', unit: 'st', bipolar: true },
+    { id: 'prnd', label: 'PITCH RND', min: 0, max: 100, def: 25, unit: '%' },
+    { id: 'reverse', label: 'REVERSE', min: 0, max: 100, def: 20, unit: '%' },
+    { id: 'spray', label: 'SPRAY', min: 0, max: 100, def: 35, unit: '%' },
+    { id: 'freeze', label: 'FREEZE', toggle: true, def: 0 },
+    { id: 'scramble', label: 'SCRAMBLE', min: 0, max: 100, def: 0, unit: '%' },
+    { id: 'width', label: 'WIDTH', min: 0, max: 100, def: 70, unit: '%' },
+    { id: 'snap', label: 'SNAP', toggle: true, def: 0 },
+    { id: 'sync', label: 'SYNC', toggle: true, def: 1 },
+    { id: 'ms', label: 'FREE', min: 10, max: 1000, def: 90, unit: 'ms', curve: 'exp' },
+  ];
+  init() {
+    const sr = this.sr;
+    const N = SPC_pow2(Math.ceil(8 * sr));
+    this.bL = SPC_f32(this, 'bL', N); this.bR = SPC_f32(this, 'bR', N); this.mask = N - 1; this.N = N; this.w = 0;
+    this.gr = new SPC_Grains(24); this.rng = new Rng(0xc10d);
+    this.ev = new Int32Array(16); this.lastTick = -1; this.next = 0; this.frz = 0;
+  }
+  _spawn(p, ctx, len, ovl, at) {
+    const rng = this.rng, sr = this.sr;
+    let semis = p.pitch;
+    if (rng.chance(p.prnd * 0.01)) semis += SPC_CLOUD_IV[rng.int(p.prnd > 60 ? 8 : 5)];
+    if (p.snap) semis = ctx.key.snapSemis(semis);
+    semis = clamp(semis, -36, 36);
+    const ratio = Math.pow(2, semis / 12);
+    const rev = rng.chance(p.reverse * 0.01);
+    const sp = p.spray * 0.01;
+    let back = 32 + (!rev && ratio > 1 ? (ratio - 1) * len : 0) + sp * sp * rng.next() * 2 * sr;
+    if (rng.chance(p.scramble * 0.01)) back += (1 + rng.int(8)) * len;
+    if (rev) back += 0; // reverse grains read backwards from the start point
+    back = Math.min(back, this.N - len * (ratio + 1) - 64);
+    const now = this.w + at;
+    this.gr.spawn(now - back, rev ? -ratio : ratio, len, 1, rng.bi() * p.width * 0.01, 1.15 / Math.sqrt(Math.max(1, ovl * 0.7)));
+  }
+  process(L, R, n, p, ctx) {
+    const sr = this.sr, spb = ctx.spb;
+    const ovl = 1 + p.density * 0.07;
+    const len = clamp(p.sync ? p.size * spb : p.ms * 0.001 * sr, 64, 2 * sr);
+    let ne = 0;
+    if (p.sync) {
+      // onsets on the ppq grid: step = SIZE / round(overlap)
+      const step = p.size / Math.max(1, Math.round(ovl));
+      const p0 = ctx.ppq, p1 = ctx.ppq + n / spb;
+      let k = Math.floor(p0 / step);
+      if (this.lastTick < 0) this.lastTick = k - 1;
+      for (let j = k; j * step < p1 && ne < 16; j++) {
+        if (j <= this.lastTick) continue;
+        const at = Math.max(0, Math.min(n - 1, Math.round((j * step - p0) * spb)));
+        this.ev[ne++] = at; this.lastTick = j;
+      }
+    } else {
+      this.lastTick = -1;
+      while (this.next < n && ne < 16) { this.ev[ne++] = Math.max(0, this.next | 0); this.next += len / ovl * (1 + 0.5 * p.spray * 0.01 * this.rng.bi()); }
+      this.next -= n;
+    }
+    this.frz = p.freeze ? 1 : 0;
+    let i0 = 0;
+    for (let e = 0; e < ne; e++) {
+      const at = this.ev[e];
+      if (at > i0) { this._dsp(L, R, i0, at); i0 = at; }
+      this._spawn(p, ctx, len, ovl, 0);
+      // density can ask for several grains per tick in sync mode when overlap is fractional
+      if (p.sync && this.rng.chance(ovl - Math.round(ovl) > 0 ? ovl - Math.round(ovl) : 0)) this._spawn(p, ctx, len, ovl, 0);
+    }
+    if (i0 < n) this._dsp(L, R, i0, n);
+  }
+  _dsp(L, R, from, to) {
+    const bL = this.bL, bR = this.bR, mask = this.mask, gr = this.gr, frz = this.frz;
+    let w = this.w;
+    for (let i = from; i < to; i++) {
+      if (!frz) { bL[w] = L[i]; bR[w] = R[i]; w = (w + 1) & mask; }
+      gr.tick(bL, bR, mask);
+      L[i] = SPC_safe(gr.oL); R[i] = SPC_safe(gr.oR);
+    }
+    this.w = w;
+  }
+});
+

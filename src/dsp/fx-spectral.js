@@ -98,7 +98,8 @@
       this._pad0 = new Float32Array(8192); this._pad1 = new Float32Array(8192); this._pw = 0;
       this._dc0 = 0; this._dc1 = 0; this._last0 = 0; this._last1 = 0;
       this.rng = new Rng((0x9E3779B9 ^ (C.id.charCodeAt(0) * 7919 + C.id.length * 104729)) >>> 0);
-      this.agcG = 1; this._Ei = 0; this._Eo = 0; this._ei = 0; this._eo = 0; this._agcA = 0.05; this._agcB = 0.1;
+      this.agcG = 1; this._Ei = 0; this._Eo = 0; this._ei = 0; this._eo = 0;
+      this.agcT = [0.25, 0.25, 0.03, 0]; // energy averaging, gain-up, gain-down times (s); [3]=1: fast-rise envelopes
       this.setup();
       this._use(this.L);
     }
@@ -112,7 +113,8 @@
       let s = this._slots[N];
       if (!s) { s = this._slots[N] = { stft: new STFT(N, 4), st: null }; s.st = this.alloc(N); }
       this.stft = s.stft; this.st = s.st;
-      this._agcA = SPX_coef(0.35, this.hop, this.sr); this._agcB = SPX_coef(0.12, this.hop, this.sr);
+      const T = this.agcT;
+      this._agcA = SPX_coef(T[0], this.hop, this.sr); this._agcU = SPX_coef(T[1], this.hop, this.sr); this._agcD = SPX_coef(T[2], this.hop, this.sr);
       this.stft.reset(); this.clear();
       this._pad0.fill(0); this._pad1.fill(0);
     }
@@ -124,19 +126,22 @@
     }
     // musical position (quarter notes) of the centre of the frame being processed
     framePPQ() { return this._ppq0 + (this._first + this._fc * this.hop + 1 - this.N * 0.5) / this._spb; }
-    // stereo-linked slow auto gain: keeps wet energy near input energy within [gmin, gmax]
+    // stereo-linked auto gain: keeps wet energy near input energy within [gmin, gmax].
+    // Energies snap on signal start; gain falls fast and rises slowly (no overshoot).
     agc(re, im, ch, ein, gmin, gmax) {
       const B = this.B; let eo = 0;
       for (let k = 0; k < B; k++) eo += re[k] * re[k] + im[k] * im[k];
       const g = this.agcG;
       if (g !== 1) for (let k = 0; k < B; k++) { re[k] *= g; im[k] *= g; }
       if (ch === 0) { this._ei = ein; this._eo = eo; return; }
-      const a = this._agcA, fl = 1e-7 * this.N * this.N;
-      this._Ei += (this._ei + ein - this._Ei) * a;
-      this._Eo += (this._eo + eo - this._Eo) * a;
+      const a = this._agcA, fl = 1e-7 * this.N * this.N, ei2 = this._ei + ein, eo2 = this._eo + eo;
+      if (this._Ei <= fl && ei2 > fl) { this._Ei = ei2; this._Eo = eo2; }
+      else if (this.agcT[3]) {
+        this._Ei += (ei2 - this._Ei) * (ei2 > this._Ei ? 0.5 : a); this._Eo += (eo2 - this._Eo) * (eo2 > this._Eo ? 0.5 : a);
+      } else { this._Ei += (ei2 - this._Ei) * a; this._Eo += (eo2 - this._Eo) * a; }
       let t = Math.sqrt((this._Ei + fl) / (this._Eo + fl));
       t = t < gmin ? gmin : t > gmax ? gmax : t;
-      this.agcG = g + (t - g) * this._agcB;
+      this.agcG = g + (t - g) * (t < g ? this._agcD : this._agcU);
     }
     process(L, R, n, p, ctx) {
       if (this.constructor.hasSize) {
@@ -287,7 +292,7 @@
       { id: 'hrate', label: 'HOLD RATE', div: ['1/1', '1/32'], def: '1/4' },
       { id: 'size', label: 'SIZE', options: SPX_SIZES, def: 2 },
     ];
-    setup() { this._k = new Float64Array(4).fill(NaN); this.hb = 0; this.hStep = NaN; this.hCap = false; this.hFirst = false; }
+    setup() { this.agcT = [0.5, 1.0, 0.04, 1]; this._k = new Float64Array(4).fill(NaN); this.hb = 0; this.hStep = NaN; this.hCap = false; this.hFirst = false; }
     alloc(N) {
       const B = N / 2 + 1, sr = this.sr, F = () => new Float32Array(B);
       const u = new Float32Array(B);
@@ -378,7 +383,7 @@
         }
         re[k] = oR; im[k] = oI;
       }
-      this.agc(re, im, ch, ein, 0.5, 4);
+      this.agc(re, im, ch, ein, 0.5, 2.5);
     }
   });
 
@@ -401,9 +406,9 @@
       { id: 'steps', label: 'STEPS', min: 1, max: 16, def: 8, curve: 'int' },
       { id: 'size', label: 'SIZE', options: SPX_SIZES, def: 2 },
     ];
-    setup() { this.pcm = new Uint8Array(12); this.near = new SPX_Near(); this.cKey = new Float64Array(5).fill(NaN); this.cIv = null; this.cCh = null; this.cR = -1; this.dirty = true; }
+    setup() { this.mk = 1; this.mkS = 1; this.pcm = new Uint8Array(12); this.near = new SPX_Near(); this.cKey = new Float64Array(5).fill(NaN); this.cIv = null; this.cCh = null; this.cR = -1; this.dirty = true; }
     alloc(N) { const B = N / 2 + 1; return { T: new Float32Array(B), G: [new Float32Array(B), new Float32Array(B)] }; }
-    onClear() { this.cR = -1; this.dirty = true; }
+    onClear() { this.cR = -1; this.dirty = true; this.mkS = this.mk; }
     block(p, ctx) {
       const key = ctx.key, pat = p.pattern | 0, ratio = p.ratio, sm = p.smooth / 100, c = this.cKey;
       if (c[0] !== pat || c[1] !== ratio || c[2] !== sm || c[3] !== key.root || c[4] !== this.N || this.cIv !== key.intervals || this.cCh !== key.chord) {
@@ -448,6 +453,11 @@
           T[k] = clamp((te - dist) / ew + 0.5, 0, 1);
         }
       }
+      // makeup gain from the pass fraction under a pink (1/f) weighting, 40 Hz..16 kHz, ≤ +8 dB
+      let num = 0, den = 0;
+      const k0 = Math.max(1, Math.round(40 / binHz)), k1 = Math.min(B - 1, Math.round(16000 / binHz));
+      for (let k = k0; k <= k1; k++) { const w = 1 / k; num += T[k] * T[k] * w; den += w; }
+      this.mk = clamp(Math.sqrt(den / Math.max(num, 1e-9)), 1, 2.5);
     }
     frame(re, im, ch) {
       const st = this.st, B = this.B;
@@ -456,13 +466,12 @@
         if (r !== this.cR || this.dirty) { this.cR = r; this.dirty = false; this.target(r); }
       }
       const T = st.T, G = st.G[ch], c = this.gc, dep = this.depth, base = 1 - dep;
-      let ein = 0;
+      if (ch === 0) this.mkS += (1 + dep * (this.mk - 1) - this.mkS) * c;
+      const mk = this.mkS;
       for (let k = 0; k < B; k++) {
-        const a = re[k], b = im[k]; ein += a * a + b * b;
-        const g = (G[k] += (T[k] - G[k]) * c), m = base + dep * g;
-        re[k] = a * m; im[k] = b * m;
+        const g = (G[k] += (T[k] - G[k]) * c), m = (base + dep * g) * mk;
+        re[k] *= m; im[k] *= m;
       }
-      this.agc(re, im, ch, ein, 0.7, 3);
     }
   });
 
@@ -505,9 +514,9 @@
       this.lc = Math.log2(c);
       const g = this.st.g, lf = this.st.t.lf, B = this.B, lc = this.lc, is2 = 0.5 / (this.sig * this.sig), gain = this.gain, tilt = this.tilt;
       for (let k = 0; k < B; k++) {
-        const d = lf[k] - lc;
-        let db = gain * Math.exp(-d * d * is2) + tilt * (d < -7 ? -7 : d > 7 ? 7 : d);
-        db = db < -60 ? -60 : db > 30 ? 30 : db;
+        const d = lf[k] - lc, dt = lf[k] - 9.9658; // tilt pivots at 1 kHz
+        let db = gain * Math.exp(-d * d * is2) + tilt * (dt < -5.5 ? -5.5 : dt > 4.5 ? 4.5 : dt);
+        db = db < -60 ? -60 : db > 24 ? 24 : db;
         g[k] = Math.exp(db * SPX_DB2LN);
       }
     }
@@ -536,7 +545,7 @@
       } else {
         for (let k = 0; k < B; k++) { const v = g[k]; re[k] *= v; im[k] *= v; }
       }
-      this.agc(re, im, ch, ein, 0.25, 1);
+      this.agc(re, im, ch, ein, 0.15, 1);
     }
   });
 
@@ -911,10 +920,10 @@
       this.piv = piv; this.ex = Math.pow(2, p.stretch / 100); this.curve = p.curve | 0;
       this.gl = SPX_coef(p.glide / 1000, this.hop, this.sr);
       const c = this.cT;
-      if (c[0] !== p.tilt || c[1] !== piv || c[2] !== this.N) {
-        c[0] = p.tilt; c[1] = piv; c[2] = this.N;
-        const tg = this.st.tg, B = this.B, binHz = this.sr / this.N, lp = Math.log2(piv);
-        for (let k = 0; k < B; k++) tg[k] = Math.exp(clamp(p.tilt * clamp(Math.log2(Math.max(0.5, k) * binHz) - lp, -8, 8), -40, 24) * SPX_DB2LN);
+      if (c[0] !== p.tilt || c[2] !== this.N) {
+        c[0] = p.tilt; c[2] = this.N;
+        const tg = this.st.tg, B = this.B, binHz = this.sr / this.N;
+        for (let k = 0; k < B; k++) tg[k] = Math.exp(p.tilt * clamp(Math.log2(Math.max(0.5, k) * binHz / 1000), -5.5, 4.5) * SPX_DB2LN);
       }
     }
     map(f) {
@@ -942,7 +951,7 @@
       pv.render(re, im, ch, this.gl, 0);
       const tg = st.tg;
       for (let k = 0; k < B; k++) { re[k] *= tg[k]; im[k] *= tg[k]; }
-      this.agc(re, im, ch, ein, 0.5, 2);
+      this.agc(re, im, ch, ein, 0.2, 2);
     }
   });
 
