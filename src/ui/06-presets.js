@@ -11,7 +11,7 @@ function definePresets() {
 
   factory('TAPE LULL', 'TAPE', P_({
     'vari.on': 1, 'vari.speed': 64, 'vari.tempo': '1/1', 'vari.wow': 55, 'vari.sat': 35, 'vari.comp': 20, 'vari.mix': 100,
-    ...fxp('oxide', { drive: 45, wow: 30, flutter: 25, noise: 20, age: 35, dull: 30 }),
+    ...fxp('oxide', { drive: 9, wow: 30, flutter: 25, noise: 20, age: 35, dull: 30 }),
     ...fxp('echotape', { timel: '1/4D', timer: '1/4', fdbk: 45, age: 50, wobble: 35 }), 'fx.echotape.mix': 35,
     ...fxp('plate', { size: 70, decay: 60 }), 'fx.plate.mix': 25,
     ...lfo(1, { shape: 'SINE', rate: '4/1' }),
@@ -42,7 +42,7 @@ function definePresets() {
   }));
 
   factory('BENT CIRCUIT', 'GLITCH', P_({
-    'stutter.on': 1, 'stutter.bend': 1, 'bend.warp': 47, 'bend.brk': 38, 'bend.reps': 8, 'bend.time': '1/1', 'bend.window': 6, 'stutter.capture': '2/1',
+    'stutter.on': 1, 'stutter.bend': 1, 'bend.warp': 47, 'bend.brk': 38, 'bend.reps': 8, 'bend.time': '1/1', 'bend.window': 6, 'stutter.capture': '1/1',
     ...fxp('chipglitch', { corrupt: 25, stall: 30 }), 'fx.chipglitch.mix': 70,
     ...fxp('crush', { bits: 10 }), 'fx.crush.mix': 60,
   }, {
@@ -51,7 +51,7 @@ function definePresets() {
   }));
 
   factory('SCRATCH TOOL', 'TURNTABLE', P_({
-    'stutter.on': 1, 'stutter.bend': 1, 'bend.warp': 78, 'bend.time': '2/1', 'stutter.capture': '2/1', 'bend.window': 0,
+    'stutter.on': 1, 'stutter.bend': 1, 'bend.warp': 78, 'bend.time': '2/1', 'stutter.capture': '1/1', 'bend.window': 0,
     'vari.on': 1, 'vari.speed': 100, 'vari.wow': 10, 'vari.sat': 30, 'time.order': 'STUTTER › STRETCH › VARI',
     ...fxp('sheen', { amount: 40 }),
   }, { chain: ['sheen'], loop: 'break', slots: [slot('m1', 'vari.speed', 100, 0), slot('m2', 'bend.warp', 70, 85)] }));

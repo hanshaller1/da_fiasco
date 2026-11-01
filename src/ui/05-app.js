@@ -26,8 +26,10 @@ function applyState(st) {
 function P_(vals, extra = {}) {
   const p = {};
   for (const [k, v] of Object.entries(vals)) {
-    const m = DEFS[k]; if (!m) continue;
+    const m = DEFS[k]; if (!m) { PRESET_WARNINGS.push('unknown param ' + k); continue; }
     const d = m.d;
+    if ((d.kind === 'enum' || d.kind === 'div') && typeof v === 'string' && d.options.indexOf(v) < 0) PRESET_WARNINGS.push(`unknown option ${k}=${v}`);
+    if (d.kind === 'num' && (v < d.min || v > d.max)) PRESET_WARNINGS.push(`out of range ${k}=${v} (${d.min}..${d.max})`);
     if (d.kind === 'enum' || d.kind === 'div') p[k] = DSP.valueToNorm(d, typeof v === 'string' ? d.options.indexOf(v) : v);
     else if (d.kind === 'toggle') p[k] = v ? 1 : 0;
     else p[k] = DSP.valueToNorm(d, v);
@@ -35,13 +37,14 @@ function P_(vals, extra = {}) {
   }
   return Object.assign({ v: 1, p, chain: [], slots: [] }, extra);
 }
+const PRESET_WARNINGS = [];
 const slot = (src, target, lo, hi, more = {}) => {
-  const m = DEFS[target]; if (!m) return null;
+  const m = DEFS[target]; if (!m) { PRESET_WARNINGS.push('unknown slot target ' + target); return null; }
   const n = (v) => (typeof v === 'string' ? DSP.valueToNorm(m.d, m.d.options.indexOf(v)) : DSP.valueToNorm(m.d, v));
   return { src, target, min: n(lo), max: n(hi), start: 0, end: 1, skew: 0, shape: 0, ...more };
 };
 const FACTORY = [];
-function factory(name, cat, st) { st.slots = (st.slots || []).filter(Boolean); st.chain = (st.chain || []).filter((id) => FXMETA[id]); FACTORY.push({ name, cat, st }); }
+function factory(name, cat, st) { for (const id of st.chain || []) if (!FXMETA[id]) PRESET_WARNINGS.push('unknown fx ' + id); st.slots = (st.slots || []).filter(Boolean); st.chain = (st.chain || []).filter((id) => FXMETA[id]); FACTORY.push({ name, cat, st }); }
 
 function userPresets() { try { return JSON.parse(localStorage.getItem('debacle.presets') || '[]'); } catch (e) { return []; } }
 function saveUserPresets(list) { try { localStorage.setItem('debacle.presets', JSON.stringify(list)); return true; } catch (e) { return false; } }
