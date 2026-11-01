@@ -187,6 +187,9 @@ body.playing .play .ic-play { display: none; }
 .hero-row { display: flex; gap: 10px; align-items: flex-start; }
 .hero-row > .kgrid { flex: 1; min-width: 0; }
 .hero-stack { display: flex; flex-direction: column; align-items: center; gap: 2px; }
+.order-badge { display: inline-grid; place-items: center; min-width: 20px; height: 20px; border-radius: 50%; background: var(--panel-2); border: 1px solid var(--line-2); font: 700 11px var(--f-mono); color: var(--accent); flex-shrink: 0; }
+.engines > .panel { position: relative; }
+@media (min-width: 821px) { .engines > .panel.chain-next::after { content: "→"; position: absolute; right: -11px; top: 12px; z-index: 2; font: 700 14px var(--f-mono); color: var(--accent); background: var(--bg); padding: 0 1px; } }
 .zone { font: 700 13px var(--f-display); letter-spacing: 0.1em; color: var(--accent); }
 .panel.bent .panel-title { color: var(--c-glitch); }
 
@@ -7851,11 +7854,17 @@ class Stretch {
     const dur = 2 * G;
     const span = dur * ratio;
     const chunkLen = this.chunkLen;
-    let start = this.chunkStart + this.readPos;
-    if (p.scatter > 0) start -= this.rng.next() * (p.scatter / 100) * chunkLen * 0.75;
-    // read a grain's worth behind so forward grains never reach the write head
-    start -= span + 4;
-    g.on = true; g.t = 0; g.dur = dur; g.rate = rev ? -ratio : ratio; g.pos = rev ? start + span : start;
+    const scat = p.scatter > 0 ? this.rng.next() * (p.scatter / 100) * chunkLen * 0.75 : 0;
+    g.on = true; g.t = 0; g.dur = dur;
+    if (rev) {
+      // REVERSE: the read head walks backwards through the material (the previous chunk,
+      // or the frozen loop) and every grain plays backwards too
+      const base = this.frozenLoop ? this.chunkStart + this.frozenLoop - this.readPos : this.chunkStart - this.readPos;
+      g.rate = -ratio; g.pos = base - 4 - scat;
+    } else {
+      // read a grain's worth behind so forward grains never reach the write head
+      g.rate = ratio; g.pos = this.chunkStart + this.readPos - scat - span - 4;
+    }
     const side = (this.gCount++ & 1) ? 1 : -1;
     const pan = side * spread, th = (pan + 1) * Math.PI / 4;
     g.gl = Math.min(1, Math.cos(th) * Math.SQRT2); g.gr = Math.min(1, Math.sin(th) * Math.SQRT2);
@@ -7902,8 +7911,8 @@ class Stretch {
       }
       this.readPos += speed;
       const avail = now - this.chunkStart;
-      if (freeze) { const loop = Math.max(64, Math.min(this.chunkLen, avail)); if (this.readPos >= loop) this.readPos -= loop * Math.floor(this.readPos / loop); }
-      else if (this.readPos > avail) this.readPos = avail;
+      if (freeze) { const loop = Math.max(64, Math.min(this.chunkLen, avail)); this.frozenLoop = loop; if (this.readPos >= loop) this.readPos -= loop * Math.floor(this.readPos / loop); }
+      else { this.frozenLoop = 0; if (this.readPos > avail) this.readPos = avail; }
       // grain scheduling
       let fire = false;
       if (sync) { const gi = Math.floor(beat / p.grain); if (gi !== this.gIdx) { this.gIdx = gi; fire = true; } }
@@ -9264,8 +9273,8 @@ function showIf(el, keyList, pred) { const upd = () => { el.hidden = !pred(); };
 function buildTime(root) {
   const routing = h('div', { class: 'routing' },
     h('span', { class: 'lbl' }, 'ENGINE ORDER'),
-    Segment('time.order', { labels: ['STRETCH › VARI › STUTTER', 'VARI › STRETCH › STUTTER', 'STUTTER › STRETCH › VARI', 'PARALLEL'], cls: 'wide' }),
-    h('span', { class: 'muted small hide-sm' }, 'Engines feed the FX chain, then MAIN. Click any knob of a sleeping engine to wake it.'));
+    Segment('time.order', { labels: ['STRETCH → VARI → STUTTER', 'VARI → STRETCH → STUTTER', 'STUTTER → STRETCH → VARI', 'ALL PARALLEL'], cls: 'wide' }),
+    h('span', { class: 'muted small hide-sm' }, 'Pick one order; the panels below follow it, left to right. Then the FX chain, then MAIN.'));
 
   // STRETCH
   const st = Panel('STRETCH', { power: 'stretch.on', sub: 'dual-grain stretch / freeze', id: 'eng-stretch', tools: [DiceBtn('Dice STRETCH', () => diceKeys(unitKeys('stretch'))), GearBtn('STRETCH dice setup', () => unitKeys('stretch'))] });
@@ -9309,6 +9318,15 @@ function buildTime(root) {
   onKey('stutter.bend', () => { normal.hidden = P['stutter.bend'] >= 0.5; bent.hidden = P['stutter.bend'] < 0.5; });
   su.body.append(suViz, normal, bent, row(Toggle('stutter.bend', { label: 'BEND', cls: 'accent' }), Toggle('stutter.seq', { label: 'SEQ' }), h('span', { class: 'muted small' }, 'BEND turns the slicer into a circuit-bent buffer mangler.')));
 
+  // panels follow the chosen engine order and carry their position in the chain
+  const panels = { st: st.el, vr: vr.el, su: su.el };
+  const badges = {};
+  for (const [k, el] of Object.entries(panels)) { badges[k] = h('span', { class: 'order-badge', 'aria-hidden': 'true' }); el.querySelector('.panel-head').prepend(badges[k]); }
+  const ORDERS = [['st', 'vr', 'su'], ['vr', 'st', 'su'], ['su', 'st', 'vr'], ['st', 'vr', 'su']];
+  onKey('time.order', () => {
+    const o = Math.round(P['time.order'] * 3), seq = ORDERS[o];
+    seq.forEach((k, i) => { panels[k].style.order = i; badges[k].textContent = o === 3 ? '∥' : String(i + 1); panels[k].classList.toggle('chain-next', o !== 3 && i < 2); });
+  });
   root.append(routing, h('div', { class: 'engines' }, st.el, vr.el, su.el));
 }
 
@@ -9967,13 +9985,14 @@ function drawEngines(dt) {
     const on = P['stretch.on'] >= 0.5, fr = P['stretch.freeze'] >= 0.5;
     c.fillStyle = cssVar(fr ? '--mod-fill' : '--panel-2'); c.fillRect(8, 18, W - 16, H - 36);
     c.strokeStyle = cssVar('--line'); c.strokeRect(8.5, 18.5, W - 17, H - 37);
-    const pos = tk && tk.sh ? tk.sh.pos : 0;
-    const grains = 10; c.fillStyle = cssVar('--fg-dim');
-    for (let g = 0; g < grains; g++) { const x = 8 + (pos * (W - 16)) - g * 6; if (x < 8) break; c.globalAlpha = 1 - g / grains; c.fillRect(x - 1, 22 + (g % 3) * 8, 3, H - 52); }
+    const rev = P['stretch.rev'] >= 0.5;
+    const raw = tk && tk.sh ? tk.sh.pos : 0, pos = rev ? 1 - raw : raw; // REVERSE reads right → left
+    const grains = 10, dir = rev ? -1 : 1; c.fillStyle = cssVar('--fg-dim');
+    for (let g = 0; g < grains; g++) { const x = 8 + (pos * (W - 16)) - dir * g * 6; if (x < 8 || x > W - 8) break; c.globalAlpha = 1 - g / grains; c.fillRect(x - 1, 22 + (g % 3) * 8, 3, H - 52); }
     c.globalAlpha = 1;
     c.fillStyle = cssVar(on ? '--accent' : '--fg-dim'); c.fillRect(8 + pos * (W - 16) - 1, 12, 2.5, H - 24);
     c.font = '600 11px ' + cssVar('--f-mono'); c.fillStyle = cssVar('--fg-dim');
-    c.fillText(fr ? 'FROZEN' : 'CAPTURE ' + fmt('stretch.tempo'), 10, 12);
+    c.fillText((fr ? 'FROZEN' : 'CAPTURE ' + fmt('stretch.tempo')) + (rev ? '  ◀ REVERSE' : ''), 10, 12);
     const sp = tk && tk.sh && on ? tk.sh.speed : getV('stretch.speed') / 100;
     c.textAlign = 'right'; c.fillText('SPEED ' + Math.round(sp * 100) + '%', W - 10, 12); c.textAlign = 'left';
   }

@@ -502,11 +502,17 @@ class Stretch {
     const dur = 2 * G;
     const span = dur * ratio;
     const chunkLen = this.chunkLen;
-    let start = this.chunkStart + this.readPos;
-    if (p.scatter > 0) start -= this.rng.next() * (p.scatter / 100) * chunkLen * 0.75;
-    // read a grain's worth behind so forward grains never reach the write head
-    start -= span + 4;
-    g.on = true; g.t = 0; g.dur = dur; g.rate = rev ? -ratio : ratio; g.pos = rev ? start + span : start;
+    const scat = p.scatter > 0 ? this.rng.next() * (p.scatter / 100) * chunkLen * 0.75 : 0;
+    g.on = true; g.t = 0; g.dur = dur;
+    if (rev) {
+      // REVERSE: the read head walks backwards through the material (the previous chunk,
+      // or the frozen loop) and every grain plays backwards too
+      const base = this.frozenLoop ? this.chunkStart + this.frozenLoop - this.readPos : this.chunkStart - this.readPos;
+      g.rate = -ratio; g.pos = base - 4 - scat;
+    } else {
+      // read a grain's worth behind so forward grains never reach the write head
+      g.rate = ratio; g.pos = this.chunkStart + this.readPos - scat - span - 4;
+    }
     const side = (this.gCount++ & 1) ? 1 : -1;
     const pan = side * spread, th = (pan + 1) * Math.PI / 4;
     g.gl = Math.min(1, Math.cos(th) * Math.SQRT2); g.gr = Math.min(1, Math.sin(th) * Math.SQRT2);
@@ -553,8 +559,8 @@ class Stretch {
       }
       this.readPos += speed;
       const avail = now - this.chunkStart;
-      if (freeze) { const loop = Math.max(64, Math.min(this.chunkLen, avail)); if (this.readPos >= loop) this.readPos -= loop * Math.floor(this.readPos / loop); }
-      else if (this.readPos > avail) this.readPos = avail;
+      if (freeze) { const loop = Math.max(64, Math.min(this.chunkLen, avail)); this.frozenLoop = loop; if (this.readPos >= loop) this.readPos -= loop * Math.floor(this.readPos / loop); }
+      else { this.frozenLoop = 0; if (this.readPos > avail) this.readPos = avail; }
       // grain scheduling
       let fire = false;
       if (sync) { const gi = Math.floor(beat / p.grain); if (gi !== this.gIdx) { this.gIdx = gi; fire = true; } }

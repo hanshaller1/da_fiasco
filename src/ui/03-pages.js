@@ -69,8 +69,8 @@ function showIf(el, keyList, pred) { const upd = () => { el.hidden = !pred(); };
 function buildTime(root) {
   const routing = h('div', { class: 'routing' },
     h('span', { class: 'lbl' }, 'ENGINE ORDER'),
-    Segment('time.order', { labels: ['STRETCH › VARI › STUTTER', 'VARI › STRETCH › STUTTER', 'STUTTER › STRETCH › VARI', 'PARALLEL'], cls: 'wide' }),
-    h('span', { class: 'muted small hide-sm' }, 'Engines feed the FX chain, then MAIN. Click any knob of a sleeping engine to wake it.'));
+    Segment('time.order', { labels: ['STRETCH → VARI → STUTTER', 'VARI → STRETCH → STUTTER', 'STUTTER → STRETCH → VARI', 'ALL PARALLEL'], cls: 'wide' }),
+    h('span', { class: 'muted small hide-sm' }, 'Pick one order; the panels below follow it, left to right. Then the FX chain, then MAIN.'));
 
   // STRETCH
   const st = Panel('STRETCH', { power: 'stretch.on', sub: 'dual-grain stretch / freeze', id: 'eng-stretch', tools: [DiceBtn('Dice STRETCH', () => diceKeys(unitKeys('stretch'))), GearBtn('STRETCH dice setup', () => unitKeys('stretch'))] });
@@ -114,6 +114,15 @@ function buildTime(root) {
   onKey('stutter.bend', () => { normal.hidden = P['stutter.bend'] >= 0.5; bent.hidden = P['stutter.bend'] < 0.5; });
   su.body.append(suViz, normal, bent, row(Toggle('stutter.bend', { label: 'BEND', cls: 'accent' }), Toggle('stutter.seq', { label: 'SEQ' }), h('span', { class: 'muted small' }, 'BEND turns the slicer into a circuit-bent buffer mangler.')));
 
+  // panels follow the chosen engine order and carry their position in the chain
+  const panels = { st: st.el, vr: vr.el, su: su.el };
+  const badges = {};
+  for (const [k, el] of Object.entries(panels)) { badges[k] = h('span', { class: 'order-badge', 'aria-hidden': 'true' }); el.querySelector('.panel-head').prepend(badges[k]); }
+  const ORDERS = [['st', 'vr', 'su'], ['vr', 'st', 'su'], ['su', 'st', 'vr'], ['st', 'vr', 'su']];
+  onKey('time.order', () => {
+    const o = Math.round(P['time.order'] * 3), seq = ORDERS[o];
+    seq.forEach((k, i) => { panels[k].style.order = i; badges[k].textContent = o === 3 ? '∥' : String(i + 1); panels[k].classList.toggle('chain-next', o !== 3 && i < 2); });
+  });
   root.append(routing, h('div', { class: 'engines' }, st.el, vr.el, su.el));
 }
 

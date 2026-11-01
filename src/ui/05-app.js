@@ -229,13 +229,14 @@ function drawEngines(dt) {
     const on = P['stretch.on'] >= 0.5, fr = P['stretch.freeze'] >= 0.5;
     c.fillStyle = cssVar(fr ? '--mod-fill' : '--panel-2'); c.fillRect(8, 18, W - 16, H - 36);
     c.strokeStyle = cssVar('--line'); c.strokeRect(8.5, 18.5, W - 17, H - 37);
-    const pos = tk && tk.sh ? tk.sh.pos : 0;
-    const grains = 10; c.fillStyle = cssVar('--fg-dim');
-    for (let g = 0; g < grains; g++) { const x = 8 + (pos * (W - 16)) - g * 6; if (x < 8) break; c.globalAlpha = 1 - g / grains; c.fillRect(x - 1, 22 + (g % 3) * 8, 3, H - 52); }
+    const rev = P['stretch.rev'] >= 0.5;
+    const raw = tk && tk.sh ? tk.sh.pos : 0, pos = rev ? 1 - raw : raw; // REVERSE reads right → left
+    const grains = 10, dir = rev ? -1 : 1; c.fillStyle = cssVar('--fg-dim');
+    for (let g = 0; g < grains; g++) { const x = 8 + (pos * (W - 16)) - dir * g * 6; if (x < 8 || x > W - 8) break; c.globalAlpha = 1 - g / grains; c.fillRect(x - 1, 22 + (g % 3) * 8, 3, H - 52); }
     c.globalAlpha = 1;
     c.fillStyle = cssVar(on ? '--accent' : '--fg-dim'); c.fillRect(8 + pos * (W - 16) - 1, 12, 2.5, H - 24);
     c.font = '600 11px ' + cssVar('--f-mono'); c.fillStyle = cssVar('--fg-dim');
-    c.fillText(fr ? 'FROZEN' : 'CAPTURE ' + fmt('stretch.tempo'), 10, 12);
+    c.fillText((fr ? 'FROZEN' : 'CAPTURE ' + fmt('stretch.tempo')) + (rev ? '  ◀ REVERSE' : ''), 10, 12);
     const sp = tk && tk.sh && on ? tk.sh.speed : getV('stretch.speed') / 100;
     c.textAlign = 'right'; c.fillText('SPEED ' + Math.round(sp * 100) + '%', W - 10, 12); c.textAlign = 'left';
   }

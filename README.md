@@ -38,6 +38,7 @@ src/index.html, style.css
 tools/build.mjs          inlines everything into dist/index.html (+ dist/artifact.html fragment)
 tools/test-fx.mjs        effect test harness (metadata, NaN/Inf, level, CPU, tails)
 tools/test-core.mjs      engine smoke test (time engines, routing, modulation, print)
+tools/test-clicks.mjs    click detector for the time engines
 docs/FX_API.md           effect authoring contract
 ```
 
