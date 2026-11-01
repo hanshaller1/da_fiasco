@@ -240,6 +240,20 @@ function FxCard(id) {
   head.addEventListener('dragstart', (e) => { e.dataTransfer.setData('text/plain', 'move:' + id); e.dataTransfer.effectAllowed = 'move'; card.classList.add('dragging'); });
   head.addEventListener('dragend', () => card.classList.remove('dragging'));
   const own = keys.slice(3).map((k) => Ctl(k));
+  // effects with a SYNC toggle: show either the tempo divisions or the free rate/time
+  const syncKey = 'fx.' + id + '.sync';
+  if (DEFS[syncKey] && DEFS[syncKey].d.kind === 'toggle') {
+    const freeIds = ['rate', 'ms', 'hz'];
+    const upd = () => {
+      const on = P[syncKey] >= 0.5;
+      keys.slice(3).forEach((k, i) => {
+        const d = DEFS[k].d;
+        if (d.kind === 'div') own[i].hidden = !on;
+        else if (d.kind === 'num' && freeIds.includes(d.id) && keys.some((q) => DEFS[q].d.kind === 'div')) own[i].hidden = on;
+      });
+    };
+    onKey(syncKey, upd);
+  }
   const body = h('div', { class: 'fx-body' }, h('div', { class: 'kgrid' }, ...own), h('div', { class: 'fx-host' }, Knob('fx.' + id + '.mix'), Knob('fx.' + id + '.gain')));
   const card = h('article', { class: 'fx-card', id: 'fx-' + id, style: { '--cat': `var(--c-${m.cat.toLowerCase()})` } }, head, h('p', { class: 'fx-desc' }, m.desc), body);
   onKey('fx.' + id + '.on', () => card.classList.toggle('is-off', P['fx.' + id + '.on'] < 0.5));

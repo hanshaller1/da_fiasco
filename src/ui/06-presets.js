@@ -63,6 +63,7 @@ function definePresets() {
   }, { chain: ['ensemble', 'spring'], loop: 'arp', slots: [slot('m1', 'vari.mode', 'FORWARD', 'REVERSE'), slot('lfo1', 'fx.ensemble.depth', 20, 90)] }));
 
   factory('GRAIN CHOIR', 'AMBIENT', P_({
+    'main.gain': 5, 
     'stretch.on': 1, 'stretch.speed': 25, 'stretch.pitch': 7, 'stretch.grain': '1/64', 'stretch.spread': 100, 'stretch.mix': 60,
     ...fxp('harmony', { v1: 2, v2: 4 }), 'fx.harmony.mix': 50,
     ...fxp('plate', { size: 85, decay: 80 }), 'fx.plate.mix': 40,
@@ -78,6 +79,7 @@ function definePresets() {
   }, { chain: ['clip', 'mauler', 'multifilter'], loop: 'break', slots: [slot('lfo4', 'fx.multifilter.cutoff', 300, 7000), slot('m1', 'fx.clip.drive', 0, 30)] }));
 
   factory('SPECTRAL GHOST', 'SPECTRAL', P_({
+    'main.gain': 10, 
     'stretch.on': 1, 'stretch.speed': 40, 'stretch.mix': 70,
     ...fxp('smear', { smear: 70 }),
     ...fxp('snapshot', {}), 'fx.snapshot.mix': 55,
@@ -92,6 +94,7 @@ function definePresets() {
   }, { chain: ['codec', 'radio', 'gate'], loop: 'keys', slots: [slot('lfo2', 'fx.radio.dial', 0, 60), slot('m1', 'fx.codec.packet', 0, 70)] }));
 
   factory('HARMONIC SHIMMER', 'TONAL', P_({
+    'main.gain': 4, 
     'stutter.on': 1, 'stutter.capture': '1/1', 'stutter.rate': '1/8', 'stutter.ramp': 5, 'stutter.decay': 30, 'stutter.mix': 60,
     ...fxp('resonate', { focus: 60 }), 'fx.resonate.mix': 55,
     ...fxp('harp', {}), 'fx.harp.mix': 45,
@@ -103,4 +106,21 @@ function definePresets() {
     ...fxp('memory', {}), ...fxp('slicer', {}), 'fx.slicer.mix': 70,
     ...fxp('echotape', { fdbk: 55 }), 'fx.echotape.mix': 30,
   }, { chain: ['slicer', 'memory', 'echotape'], loop: 'break', slots: [slot('m1', 'fx.slicer.shuffle', 0, 100)] }));
+
+  factory('BARBER POLE', 'MOTION', P_({
+    'main.gain': 6, 
+    'stretch.on': 1, 'stretch.speed': 35, 'stretch.spread': 60, 'stretch.mix': 80,
+    ...fxp('phaser', { barber: 'RISE', depth: 70, fdbk: 55, stages: 8 }),
+    ...fxp('flanger', { barber: 'FALL', depth: 60, fdbk: 40 }), 'fx.flanger.mix': 45,
+    ...fxp('echotape', { timel: '1/8D', timer: '1/4', fdbk: 40 }), 'fx.echotape.mix': 30,
+  }, { chain: ['phaser', 'flanger', 'echotape'], loop: 'choir', slots: [slot('m1', 'fx.phaser.fdbk', 20, 85), slot('lfo1', 'stretch.speed', 15, 60)] }));
+
+  factory('FLYBY DUB', 'MOTION', P_({
+    'main.gain': 7, 
+    'stutter.on': 1, 'stutter.prob': 35, 'stutter.capture': '1/1', 'stutter.rate': '1/8', 'stutter.decay': 40,
+    ...fxp('doppler', { path: 'ORBIT', distance: 12, depth: 70 }),
+    ...fxp('multihead', { heads: 3, fdbk: 55, halo: 40 }), 'fx.multihead.mix': 40,
+    ...fxp('multifilter', { cutoff: 1400, res: 35, mode: 'BP' }), 'fx.multifilter.mix': 70,
+    ...fxp('plate', { size: 70, decay: 55 }), 'fx.plate.mix': 25,
+  }, { chain: ['multifilter', 'doppler', 'multihead', 'plate'], loop: 'arp', slots: [slot('graph3', 'fx.multifilter.cutoff', 400, 4000), slot('x', 'fx.doppler.depth', 10, 100), slot('y', 'fx.multihead.fdbk', 20, 85)] }));
 }

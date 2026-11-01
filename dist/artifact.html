@@ -2780,7 +2780,7 @@ function defaultSeq(kind) {
         return;
       }
       // self-oscillation: ladder above ~95 % RES; diode threshold rises at low cutoff (HP in the feedback path)
-      const rr = res * Math.sqrt(res), diode = type === 2, k0 = diode ? 6.2 * rr : 4.5 * rr;
+      const rr = res * Math.sqrt(res), diode = type === 2, k0 = diode ? 5.8 * rr : 4.5 * rr;
       let cm = 1;
       if (mode === 0) cm = diode ? 1 + 0.45 * k0 : 1 + 0.7 * k0;
       else if (mode === 3) cm = diode ? 1 + 0.1 * k0 : 1 + 0.35 * k0;
@@ -2903,94 +2903,85 @@ function defaultSeq(kind) {
       const sr = this.sr, maxD = Math.ceil(sr / 7) + 8, sz = MOT_pow2(maxD + 8);
       this.rb = []; for (let j = 0; j < 6; j++) this.rb.push(new Float32Array(sz));
       this.rm = sz - 1; this.rw = 0; this.maxD = maxD - 8;
-      this.st = new Float64Array(16);  // tone LP ic1/ic2 L,R (0..3); loop low-pass x6 (4..9); tone HP L,R (10..13); fb, og (14, 15)
-      this.dv = new Float64Array(3); this.dt = new Float64Array(3);
+      // per channel (stride 12): tone LP ic1/ic2, tone HP ic1/ic2, loop LP x3, delays x3, fb, og
+      this.st = new Float64Array(24); this.rs = new Int32Array([0x2545f491, 0x1b873593]);
+      this.dt = new Float64Array(3); this.ba = new Float64Array(128);
       this.sc = 1 - Math.exp(-1 / (0.025 * sr));
-      this.tone = new MOT_SVF();
       this.efa = Math.exp(-1 / (0.0003 * sr)); this.efr = Math.exp(-1 / (0.015 * sr));
       this.esa = Math.exp(-1 / (0.012 * sr)); this.esr = Math.exp(-1 / (0.2 * sr));
-      this.ef = 0; this.es = 0; this.rs = 0x2545f491;
+      this.ef = 0; this.es = 0;
       this.bAmp = 0; this.bDec = Math.exp(-1 / (0.007 * sr)); this.refr = 0;
       this.snp = [new MOT_Snap(), new MOT_Snap(), new MOT_Snap()];
       this.first = true; this.toneV = 0; this.K = new Float64Array(16); this.lpT = new MOT_SVF(); this.hpT = new MOT_SVF();
     }
     process(L, R, n, p, ctx) {
       p = this.ps.step(p, n, this.sr);
-      const sr = this.sr, fb = p.fb * 0.01, neg = fb < 0, afb = neg ? -fb : fb;
+      const sr = this.sr, fb = p.fb * 0.01, afb = Math.abs(fb), st = this.st;
       const damp = p.damp * 0.01;
       const fd = 18000 * Math.pow(600 / 18000, damp), cl = 1 - Math.exp(-2 * Math.PI * fd / sr), gd = (1 - cl) / cl;
-      const dt = this.dt, dv = this.dv;
+      const dt = this.dt;
       for (let j = 0; j < 3; j++) {
         let f = p.freq * semisToRatio(j === 0 ? 0 : j === 1 ? p.off1 : p.off2);
         if (p.snap) f = this.snp[j].hz(ctx.key, f);
         // delay for y[n-D] (read before the write). Negative feedback keeps D: odd harmonics, an octave lower
-        let D = sr / f - gd - 1;
-        if (D < 3) D = 3; else if (D > this.maxD) D = this.maxD;
-        dt[j] = D; if (this.first) dv[j] = D;
+        dt[j] = Math.max(3, Math.min(this.maxD, sr / f - gd - 1));
       }
-      // tone tilt: LP below centre, HP above (one coefficient set for both channels)
+      // tone tilt = LP (closes below centre) in series with HP (opens above centre): both always running
       const tv = p.tone * 0.01;
       this.toneV += (tv - this.toneV) * (this.first ? 1 : 0.3);
-      this.first = false;
-      // tone tilt = LP (closes below centre) in series with HP (opens above centre): both always running
       const t = this.toneV, lpT = this.lpT, hpT = this.hpT;
       lpT.lp(MOT_g(18000 * Math.pow(2, Math.min(0, t) * 6.5), sr), 0.6); hpT.hp(MOT_g(20 * Math.pow(2, Math.max(0, t) * 7.6), sr), 0.6);
       const og = 0.5 * Math.sqrt((1 - afb * afb) / (1 + afb * afb)) + 0.02;
+      if (this.first) {
+        for (let c = 0; c < 2; c++) { const o = c * 12; st[o + 7] = dt[0]; st[o + 8] = dt[1]; st[o + 9] = dt[2]; st[o + 10] = fb; st[o + 11] = og; }
+        this.first = false;
+      }
       const K = this.K;
-      K[0] = fb; K[1] = cl; K[2] = og; K[3] = p.pluck * 0.01; K[4] = lpT.a1; K[5] = lpT.a2; K[6] = lpT.a3; K[7] = hpT.a1; K[8] = hpT.a2; K[9] = hpT.a3; K[10] = hpT.k;
-      if (this.st[15] === 0) { this.st[14] = fb; this.st[15] = og; }
-      this._k(L, R, n);
+      K[0] = fb; K[1] = cl; K[2] = og; K[4] = lpT.a1; K[5] = lpT.a2; K[6] = lpT.a3; K[7] = hpT.a1; K[8] = hpT.a2; K[9] = hpT.a3; K[10] = hpT.k;
+      this._env(L, R, n, p.pluck * 0.01);
+      this._k(L, n, 0); this._k(R, n, 1);
+      this.rw = (this.rw + n) & this.rm;
     }
-    // per-sample kernel (compact, so the JIT tiers it up quickly)
-    _k(L, R, n) {
-      const K = this.K, sr = this.sr, dt = this.dt, dv = this.dv;
-      const cl = K[1], pl = K[3], ta1 = K[4], ta2 = K[5], ta3 = K[6], ha1 = K[7], ha2 = K[8], ha3 = K[9], hk = K[10];
-      const refrN = Math.round(0.06 * sr), bDec = this.bDec, sc = this.sc;
-      const efa = this.efa, efr = this.efr, esa = this.esa, esr = this.esr;
-      const b0 = this.rb[0], b1 = this.rb[1], b2 = this.rb[2], b3 = this.rb[3], b4 = this.rb[4], b5 = this.rb[5], m = this.rm;
-      const st = this.st, t0 = dt[0], t1 = dt[1], t2 = dt[2];
-      let w = this.rw, v0 = dv[0], v1 = dv[1], v2 = dv[2], ef = this.ef, es = this.es, rs = this.rs, bAmp = this.bAmp, refr = this.refr;
-      let tl1 = st[0], tl2 = st[1], tr1 = st[2], tr2 = st[3], l0 = st[4], l1 = st[5], l2 = st[6], l3 = st[7], l4 = st[8], l5 = st[9];
-      let hl1 = st[10], hl2 = st[11], hr1 = st[12], hr2 = st[13], fb = st[14], og = st[15];
+    // transient detector on the mono input -> per-sample pluck-burst amplitude (this.ba)
+    _env(L, R, n, pl) {
+      const ba = this.ba, efa = this.efa, efr = this.efr, esa = this.esa, esr = this.esr, bDec = this.bDec, refrN = Math.round(0.06 * this.sr);
+      let ef = this.ef, es = this.es, bAmp = this.bAmp, refr = this.refr;
+      for (let i = 0; i < n; i++) {
+        const am = 0.5 * (Math.abs(L[i]) + Math.abs(R[i]));
+        ef = am + (am > ef ? efa : efr) * (ef - am); es = am + (am > es ? esa : esr) * (es - am);
+        refr--;
+        const trig = ((ef - es * 1.6 - 0.01) * pl > 0 ? 1 : 0) * (refr < 0 ? 1 : 0); // branch-light (no cold JIT paths)
+        bAmp = Math.max(bAmp, trig * pl * Math.min(1, ef * 2) * 0.8); refr = trig ? refrN : refr;
+        ba[i] = bAmp; bAmp *= bDec;
+      }
+      this.ef = ef; this.es = es; this.bAmp = bAmp < 1e-6 ? 0 : bAmp; this.refr = Math.max(-1, refr);
+    }
+    // per-channel kernel: pluck noise -> tone (LP, HP) -> three feedback combs y = ex + fb * tanh(lp(y[n-D]))
+    _k(buf, n, c) {
+      const K = this.K, st = this.st, dt = this.dt, ba = this.ba, o = c * 12, sc = this.sc;
+      const cl = K[1], ta1 = K[4], ta2 = K[5], ta3 = K[6], ha1 = K[7], ha2 = K[8], ha3 = K[9], hk = K[10];
+      const b0 = this.rb[c * 3], b1 = this.rb[c * 3 + 1], b2 = this.rb[c * 3 + 2], m = this.rm, t0 = dt[0], t1 = dt[1], t2 = dt[2];
+      let w = this.rw, rs = this.rs[c];
+      let lp1 = st[o], lp2 = st[o + 1], hp1 = st[o + 2], hp2 = st[o + 3], l0 = st[o + 4], l1 = st[o + 5], l2 = st[o + 6];
+      let v0 = st[o + 7], v1 = st[o + 8], v2 = st[o + 9], fb = st[o + 10], og = st[o + 11];
       const fbI = (K[0] - fb) / n, ogI = (K[2] - og) / n;
       for (let i = 0; i < n; i++) {
-        v0 += (t0 - v0) * sc; v1 += (t1 - v1) * sc; v2 += (t2 - v2) * sc;
-        let xl = L[i], xr = R[i];
-        const am = 0.5 * ((xl < 0 ? -xl : xl) + (xr < 0 ? -xr : xr));
-        ef = am + (am > ef ? efa : efr) * (ef - am); es = am + (am > es ? esa : esr) * (es - am);
-        // transient -> pluck burst (branch-light so the JIT never meets a cold path)
-        refr--;
-        const hit = (ef - es * 1.6 - 0.01) * pl;
-        const trig = (hit > 0 ? 1 : 0) * (refr < 0 ? 1 : 0);
-        bAmp = Math.max(bAmp, trig * pl * Math.min(1, ef * 2) * 0.8); refr = trig ? refrN : refr;
+        v0 += (t0 - v0) * sc; v1 += (t1 - v1) * sc; v2 += (t2 - v2) * sc; fb += fbI; og += ogI;
         rs ^= rs << 13; rs ^= rs >>> 17; rs ^= rs << 5;
-        xl += ((rs & 0xffff) * 3.0517578125e-5 - 1) * bAmp; xr += ((rs >>> 16) * 3.0517578125e-5 - 1) * bAmp;
-        bAmp *= bDec;
-        fb += fbI; og += ogI;
-        // tone: LP then HP (SVFs)
-        let v3 = xl - tl2, q1 = ta1 * tl1 + ta2 * v3, q2 = tl2 + ta2 * tl1 + ta3 * v3;
-        tl1 = 2 * q1 - tl1; tl2 = 2 * q2 - tl2; let ex = q2;
-        v3 = ex - hl2; q1 = ha1 * hl1 + ha2 * v3; q2 = hl2 + ha2 * hl1 + ha3 * v3;
-        hl1 = 2 * q1 - hl1; hl2 = 2 * q2 - hl2; const exl = ex - hk * q1 - q2;
-        v3 = xr - tr2; q1 = ta1 * tr1 + ta2 * v3; q2 = tr2 + ta2 * tr1 + ta3 * v3;
-        tr1 = 2 * q1 - tr1; tr2 = 2 * q2 - tr2; ex = q2;
-        v3 = ex - hr2; q1 = ha1 * hr1 + ha2 * v3; q2 = hr2 + ha2 * hr1 + ha3 * v3;
-        hr1 = 2 * q1 - hr1; hr2 = 2 * q2 - hr2; const exr = ex - hk * q1 - q2;
-        // combs: y = ex + fb * tanh(lp(y[n-D]))
-        let y, sl, sr2;
-        l0 += cl * (MOT_rd(b0, m, w, v0) - l0); y = exl + fb * MOT_tanh(l0); b0[w] = y; sl = y;
-        l1 += cl * (MOT_rd(b1, m, w, v1) - l1); y = exl + fb * MOT_tanh(l1); b1[w] = y; sl += y;
-        l2 += cl * (MOT_rd(b2, m, w, v2) - l2); y = exl + fb * MOT_tanh(l2); b2[w] = y; sl += y;
-        l3 += cl * (MOT_rd(b3, m, w, v0) - l3); y = exr + fb * MOT_tanh(l3); b3[w] = y; sr2 = y;
-        l4 += cl * (MOT_rd(b4, m, w, v1) - l4); y = exr + fb * MOT_tanh(l4); b4[w] = y; sr2 += y;
-        l5 += cl * (MOT_rd(b5, m, w, v2) - l5); y = exr + fb * MOT_tanh(l5); b5[w] = y; sr2 += y;
+        const x = buf[i] + rs * 4.656612873077393e-10 * ba[i];
+        let v3 = x - lp2, q1 = ta1 * lp1 + ta2 * v3, q2 = lp2 + ta2 * lp1 + ta3 * v3;
+        lp1 = 2 * q1 - lp1; lp2 = 2 * q2 - lp2; const e = q2;
+        v3 = e - hp2; q1 = ha1 * hp1 + ha2 * v3; q2 = hp2 + ha2 * hp1 + ha3 * v3;
+        hp1 = 2 * q1 - hp1; hp2 = 2 * q2 - hp2; const ex = e - hk * q1 - q2;
+        let y, sum;
+        l0 += cl * (MOT_rd(b0, m, w, v0) - l0); y = ex + fb * MOT_tanh(l0); b0[w] = y; sum = y;
+        l1 += cl * (MOT_rd(b1, m, w, v1) - l1); y = ex + fb * MOT_tanh(l1); b1[w] = y; sum += y;
+        l2 += cl * (MOT_rd(b2, m, w, v2) - l2); y = ex + fb * MOT_tanh(l2); b2[w] = y; sum += y;
         w = (w + 1) & m;
-        L[i] = sl * og; R[i] = sr2 * og;
+        buf[i] = sum * og;
       }
-      st[0] = tl1; st[1] = tl2; st[2] = tr1; st[3] = tr2; st[4] = l0; st[5] = l1; st[6] = l2; st[7] = l3; st[8] = l4; st[9] = l5;
-      st[10] = hl1; st[11] = hl2; st[12] = hr1; st[13] = hr2; st[14] = fb; st[15] = og;
-      dv[0] = v0; dv[1] = v1; dv[2] = v2; this.rw = w; this.ef = ef; this.es = es; this.rs = rs;
-      this.bAmp = bAmp < 1e-6 ? 0 : bAmp; this.refr = refr < -1e6 ? -1 : refr;
+      st[o] = lp1; st[o + 1] = lp2; st[o + 2] = hp1; st[o + 3] = hp2; st[o + 4] = l0; st[o + 5] = l1; st[o + 6] = l2;
+      st[o + 7] = v0; st[o + 8] = v1; st[o + 9] = v2; st[o + 10] = fb; st[o + 11] = og; this.rs[c] = rs;
     }
   });
 
@@ -3068,6 +3059,7 @@ function defaultSeq(kind) {
       for (let off = 0; off < n; off += 16) {
         const m = n - off < 16 ? n - off : 16, fr0 = (off + m) / n;
         const qs = Math.pow(2, (0.5 - (q0 + qd * fr0) * 0.01) * 3.2), shL = (h0 + hd * fr0) / 12 * MOT_LN2, sp = (s0 + sd * fr0) * 0.01;
+        const mkq = mk * Math.sqrt(0.8950 / qs); // broadband energy ~ bandwidth: keep level steady across Q
         let tgt = base;
         if (p.seq) { const b = p.rate > 1e-4 ? p.rate : 1e-4; tgt += Math.floor((ctx.ppq + off / ctx.spb) / b + 1e-9); }
         tgt -= 5 * Math.floor(tgt / 5);
@@ -3078,7 +3070,7 @@ function defaultSeq(kind) {
         this.pv = v;
         for (let c = 0; c < 2; c++) {
           let pos = v + (c ? sp : -sp) * 0.6; pos -= 5 * Math.floor(pos / 5);
-          let i0 = Math.floor(pos); if (i0 > 4) i0 = 4;
+          const i0 = Math.min(4, Math.floor(pos));
           const fr = pos - i0, i1 = i0 === 4 ? 0 : i0 + 1;
           const lo = shL + (c ? sp : -sp) * 0.04, cf = this.cf[c];
           for (let j = 0; j < 5; j++) {
@@ -3088,7 +3080,7 @@ function defaultSeq(kind) {
             let k = (V[o0 + 2] + (V[o1 + 2] - V[o0 + 2]) * fr) * qs / F;
             k = Math.max(0.015, Math.min(1.6, k));
             const g = MOT_g(F, sr), a1 = 1 / (1 + g * (g + k)), o = j * 4;
-            cf[o] = a1; cf[o + 1] = g * a1; cf[o + 2] = g * g * a1; cf[o + 3] = amp * k * mk;
+            cf[o] = a1; cf[o + 1] = g * a1; cf[o + 2] = g * g * a1; cf[o + 3] = amp * k * mkq;
           }
         }
         this._k(L, this.cf[0], this.st[0], off, off + m);
@@ -3407,7 +3399,7 @@ function defaultSeq(kind) {
       this.dl = [new DelayLine(Math.ceil(sr * 0.1)), new DelayLine(Math.ceil(sr * 0.1))];
       this.lfo = new MOT_LFO();
       this.bS = new Smoother(sr, 40, 0.7); this.dS = new Smoother(sr, 40, 0.75); this.first = true;
-      this.fbS = new Float64Array(2); this.fbv = -10; this.sg = 0;
+      this.fbS = new Float64Array(2); this.fbv = -10; this.sg = 0; this.K = new Float64Array(12);
     }
     process(L, R, n, p, ctx) {
       p = this.ps.step(p, n, this.sr);
@@ -3419,37 +3411,43 @@ function defaultSeq(kind) {
       if (this.fbv < -9) this.fbv = fbT;
       let fb = this.fbv, sg = this.sg; const fbI = (fbT - fb) / n, sgT = fbT < 0 ? -1 : 1, sgR = 1 / (0.005 * sr); this.fbv = fbT;
       if (sg === 0) sg = sgT;
-      const wo = p.width * 0.005, fbS = this.fbS, bS = this.bS, dS = this.dS;
+      const K = this.K;
+      K[0] = ph; K[1] = inc; K[2] = fb; K[3] = fbI; K[4] = sg; K[5] = sgT; K[6] = sgR; K[7] = barber; K[8] = tzf ? 1 : 0; K[9] = p.width * 0.005;
+      this._k(L, R, n);
+    }
+    // per-sample kernel: write (input + soft-clipped feedback), read modulated tap(s), mix with dry
+    _k(L, R, n) {
+      const K = this.K, inc = K[1], fbI = K[3], sgT = K[5], sgR = K[6], barber = K[7], tzf = K[8], wo = K[9];
+      const msr = this.sr * 0.001, fbS = this.fbS, bS = this.bS, dS = this.dS, dlL = this.dl[0], dlR = this.dl[1];
+      const m = dlL.mask, bL = dlL.buf, bR = dlR.buf, dmax = dlL.size - 8;
+      let ph = K[0], fb = K[2], sg = K[4], w = dlL.w;
       for (let i = 0; i < n; i++) {
         ph += inc; ph -= Math.floor(ph);
         fb += fbI;
         sg += Math.max(-sgR, Math.min(sgR, sgT - sg)); // wet polarity follows the FDBK sign, slewed over ~5 ms
         const base = bS.next() * msr, dep = dS.next();
+        bL[w] = L[i] + fb * MOT_tanh(fbS[0]); bR[w] = R[i] + fb * MOT_tanh(fbS[1]); w = (w + 1) & m;
         for (let c = 0; c < 2; c++) {
-          const buf = c ? R : L, dl = this.dl[c], x = buf[i];
-          dl.write(x + fb * MOT_tanh(fbS[c]));
+          const buf = c ? R : L, b = c ? bR : bL, x = buf[i];
           const pc = c ? ph + wo : ph;
           let dry = x, wet;
           if (barber) {
-            const r1 = pc - Math.floor(pc), r2 = MOT_frac(pc + 0.5), oc = 1 + dep * 3;
+            const r1 = pc - Math.floor(pc), r2 = MOT_frac(pc + 0.5), oc = (1 + dep * 3) * MOT_LN2;
             const e1 = barber === 1 ? 1 - r1 : r1, e2 = barber === 1 ? 1 - r2 : r2;
-            const t1 = dl.read(2 + base * Math.exp(oc * MOT_LN2 * e1)), t2 = dl.read(2 + base * Math.exp(oc * MOT_LN2 * e2));
+            const t1 = MOT_rd(b, m, w, Math.min(dmax, 2 + base * Math.exp(oc * e1))), t2 = MOT_rd(b, m, w, Math.min(dmax, 2 + base * Math.exp(oc * e2)));
             const w1 = 0.5 - 0.5 * Math.cos(TAU * r1);
             wet = t1 * w1 + t2 * (1 - w1);
           } else if (tzf) {
-            const l = Math.cos(TAU * pc);
-            const ref = base + 2;
-            dry = dl.read(ref);
-            wet = dl.read(2 + base * (1 + dep * l));
+            dry = MOT_rd(b, m, w, base + 2);
+            wet = MOT_rd(b, m, w, 2 + base * (1 + dep * Math.cos(TAU * pc)));
           } else {
-            const l = 0.5 - 0.5 * Math.cos(TAU * pc);
-            wet = dl.read(1.5 + base * Math.exp(dep * 3 * MOT_LN2 * l));
+            wet = MOT_rd(b, m, w, 1.5 + base * Math.exp(dep * 3 * MOT_LN2 * (0.5 - 0.5 * Math.cos(TAU * pc))));
           }
           fbS[c] = wet;
           buf[i] = 0.5 * (dry + sg * wet);
         }
       }
-      this.sg = sg;
+      dlL.w = w; dlR.w = w; this.sg = sg;
     }
   });
 
@@ -3815,7 +3813,9 @@ function defaultSeq(kind) {
       this.ps = new MOT_PSm(this.constructor.params);
       const sr = this.sr;
       this.lA = [new DelayLine(Math.ceil(sr * 0.36)), new DelayLine(Math.ceil(sr * 0.36))];
+      // rotor bands (horn = highs, drum = lows); all lines are written every sample so path changes never read stale audio
       this.lB = [new DelayLine(Math.ceil(sr * 0.06)), new DelayLine(Math.ceil(sr * 0.06))];
+      this.lH = [new DelayLine(Math.ceil(sr * 0.06)), new DelayLine(Math.ceil(sr * 0.06))];
       this.maxA = Math.ceil(sr * 0.35); this.maxB = Math.ceil(sr * 0.05);
       this.lfo = new MOT_LFO(); this.dph = 0;
       // taps: [srcA earL, srcA earR, srcB earL, srcB earR]
@@ -3825,7 +3825,7 @@ function defaultSeq(kind) {
       this.xo = new Float64Array(2); this.xoc = 1 - Math.exp(-TAU * 800 / sr);
       this.rx = new Float64Array(4); this.rt = new Float64Array(2); this.rseg = -1;
       this.rng = new Rng(0xd0bb1e);
-      this.path = -1; this.fade = 0; this.Ds = 8; this.first = true; this.dsc = 0.9; this.wid = 0.7;
+      this.path = -1; this.fade = 0; this.Ds = 8; this.first = true; this.snap = true; this.dsc = 0.9; this.wid = 0.7;
     }
     // source position (x right, y front) for source k at path phase t; returns [x,y] in this.px/py
     _pos(path, t, D, k) {
@@ -3879,7 +3879,7 @@ function defaultSeq(kind) {
         const pan = x / dc * width * 0.8;
         const dd = Math.max(0, dscale * (dc - dref));
         const dl = Math.sqrt((x + ear) * (x + ear) + y * y), dr = Math.sqrt((x - ear) * (x - ear) + y * y);
-        const lim = path === 5 && k === 1 ? this.maxB : this.maxA;
+        const lim = path === 5 ? this.maxB : this.maxA; // rotor taps read the short band lines
         this.dN[k * 2] = Math.min(lim, 2 + itd + (dd + dl - dc) / MOT_C * sr);
         this.dN[k * 2 + 1] = Math.min(lim, 2 + itd + (dd + dr - dc) / MOT_C * sr);
         this.gN[k * 2] = g * Math.sqrt(1 - pan) * this.fade;
@@ -3898,23 +3898,23 @@ function defaultSeq(kind) {
       const ph0 = this.lfo.block(p.sync, p.div, p.rate, ctx, n, sr, false), inc = this.lfo.inc;
       const dscale = p.depth * 0.015, width = p.width * 0.01, air = p.air * 0.01;
       const STEP = 16;
-      if (this.first) { this.path = path; this.Ds = p.distance; this.fade = 1; }
+      if (this.first) { this.path = path; this.Ds = p.distance; this.fade = 1; this.snap = true; this.first = false; }
       const dP = this.dP, dN = this.dN, gP = this.gP, gN = this.gN, aP = this.aP, aN = this.aN, lpS = this.lpS, xo = this.xo, xoc = this.xoc;
-      const lAL = this.lA[0], lAR = this.lA[1], lBL = this.lB[0], lBR = this.lB[1];
+      const lAL = this.lA[0], lAR = this.lA[1], lBL = this.lB[0], lBR = this.lB[1], lHL = this.lH[0], lHR = this.lH[1];
       for (let off = 0; off < n; off += STEP) {
         const m = n - off < STEP ? n - off : STEP;
         // path switch: fade out, swap, fade in
-        if (path !== this.path) { this.fade -= m / 384; if (this.fade <= 0) { this.fade = 0; this.path = path; this.rseg = -1; this.first = true; } }
+        if (path !== this.path) { this.fade -= m / 384; if (this.fade <= 0) { this.fade = 0; this.path = path; this.rseg = -1; this.snap = true; } }
         else if (this.fade < 1) { this.fade += m / 384; if (this.fade > 1) this.fade = 1; }
         this.Ds += (p.distance - this.Ds) * (1 - Math.exp(-m / (0.25 * sr)));
-        const gk = this.first ? 1 : 1 - Math.exp(-m / (0.15 * sr));
+        const gk = this.snap ? 1 : 1 - Math.exp(-m / (0.15 * sr));
         this.dsc += (dscale - this.dsc) * gk; this.wid += (width - this.wid) * gk;
         this.dph = MOT_frac(this.dph + inc * 0.9 * m);
-        if (this.first && this.path === 4) {
+        if (this.snap && this.path === 4) {
           const rx = this.rx, D = this.Ds; rx[0] = rx[2] = 0.3 * D; rx[1] = rx[3] = 0.6 * D;
         }
         this._ctl(MOT_frac(ph0 + inc * (off + m)), m, this.dsc, this.wid, air, sr);
-        if (this.first) { dP.set(dN); gP.set(gN); aP.set(aN); this.first = false; }
+        if (this.snap) { dP.set(dN); gP.set(gN); aP.set(aN); this.snap = false; }
         const rotor = this.path === 5, im = 1 / m;
         const dd0 = (dN[0] - dP[0]) * im, dd1 = (dN[1] - dP[1]) * im, dd2 = (dN[2] - dP[2]) * im, dd3 = (dN[3] - dP[3]) * im;
         const gd0 = (gN[0] - gP[0]) * im, gd1 = (gN[1] - gP[1]) * im, gd2 = (gN[2] - gP[2]) * im, gd3 = (gN[3] - gP[3]) * im;
@@ -3924,12 +3924,11 @@ function defaultSeq(kind) {
           d0 += dd0; d1 += dd1; d2 += dd2; d3 += dd3; g0 += gd0; g1 += gd1; g2 += gd2; g3 += gd3; ac += ad;
           const xl = L[i], xr = R[i];
           let yl, yr;
+          xo[0] += xoc * (xl - xo[0]); xo[1] += xoc * (xr - xo[1]);
+          lAL.write(xl); lAR.write(xr); lHL.write(xl - xo[0]); lHR.write(xr - xo[1]); lBL.write(xo[0]); lBR.write(xo[1]);
           if (rotor) {
-            xo[0] += xoc * (xl - xo[0]); xo[1] += xoc * (xr - xo[1]);
-            lAL.write(xl - xo[0]); lAR.write(xr - xo[1]); lBL.write(xo[0]); lBR.write(xo[1]);
-            yl = g0 * lAL.read(d0) + g2 * lBL.read(d2); yr = g1 * lAR.read(d1) + g3 * lBR.read(d3);
+            yl = g0 * lHL.read(d0) + g2 * lBL.read(d2); yr = g1 * lHR.read(d1) + g3 * lBR.read(d3);
           } else {
-            lAL.write(xl); lAR.write(xr);
             yl = g0 * lAL.read(d0); yr = g1 * lAR.read(d1);
             if (g2 !== 0 || g3 !== 0) { yl += g2 * lAL.read(d2); yr += g3 * lAR.read(d3); }
           }
@@ -3964,7 +3963,7 @@ function defaultSeq(kind) {
       this.ps = new MOT_PSm(this.constructor.params);
       this.z = [new Float64Array(66), new Float64Array(66)];
       this.c = [new Float64Array(66), new Float64Array(66)];
-      this.fbS = new Float64Array(2); this.cnt = new MOT_FracCount();
+      this.fbS = new Float64Array(2); this.cnt = new MOT_FracCount(); this.hpS = new Float64Array(2); this.hpc = 0.01;
       this.g = new Float64Array(4); // ramped: trail, drive mix, drive gain, drive norm
       this.lf = 0; this.q = 0; this.sp = 0; this.first = true; this.nb = -1;
       this.c32 = 1 - Math.exp(-32 / (0.015 * this.sr));
@@ -3984,7 +3983,9 @@ function defaultSeq(kind) {
       p = this.ps.step(p, n, this.sr);
       const tlf = Math.log(p.focus), tq = 0.4 * Math.pow(2, p.reso * 0.045), tsp = p.spread * 0.01, cnt = this.cnt;
       const nb = cnt.step(p.amount, 32, 0.5);
-      const d = p.drive * 0.01, g = this.g, t0 = p.trail * 0.01, t1 = Math.min(1, d * 3), t2 = 1 + 15 * d * d, t3 = 0.5 / MOT_tanh(0.5 * t2);
+      // TRAIL fades in over the first stage (no plain feedback loop at AMOUNT 0)
+      const d = p.drive * 0.01, g = this.g, t0 = p.trail * 0.01 * Math.min(1, cnt.v), t1 = Math.min(1, d * 3), t2 = 1 + 15 * d * d, t3 = 0.5 / MOT_tanh(0.5 * t2);
+      this.hpc = 1 - Math.exp(-TAU * Math.max(40, p.focus * 0.12) / this.sr); // feedback high-pass: no bass build-up
       if (this.first) { this.lf = tlf; this.q = tq; this.sp = tsp; g[0] = t0; g[1] = t1; g[2] = t2; g[3] = t3; this._coefs(nb); this.first = false; }
       if (nb !== this.nb) {
         if (nb > this.nb) this._coefs(nb);
@@ -4007,12 +4008,13 @@ function defaultSeq(kind) {
     }
     // per-channel allpass chain: TDF-II 2nd-order allpasses; stage nb blended by the fractional AMOUNT
     _k(buf, c, a, e, nb, fw, fI, g, off, i0, i1, i2, i3) {
-      const z = this.z[c], co = this.c[c];
-      let fbv = this.fbS[c], tr = g[0] + i0 * off, dm = g[1] + i1 * off, dg = g[2] + i2 * off, dn = g[3] + i3 * off;
+      const z = this.z[c], co = this.c[c], hpc = this.hpc;
+      let fbv = this.fbS[c], hp = this.hpS[c], tr = g[0] + i0 * off, dm = g[1] + i1 * off, dg = g[2] + i2 * off, dn = g[3] + i3 * off;
       const last = Math.min(nb, 31) * 2;
       for (let i = a; i < e; i++) {
         fw += fI; tr += i0; dm += i1; dg += i2; dn += i3;
-        let x = buf[i] + tr * MOT_tanh(fbv);
+        hp += hpc * (fbv - hp);
+        let x = buf[i] + tr * MOT_tanh(fbv - hp);
         x += (MOT_tanh(x * dg) * dn - x) * dm; // drive (dm = 0 when off)
         let y = x;
         for (let j2 = 0; j2 < last; j2 += 2) {
@@ -4030,7 +4032,7 @@ function defaultSeq(kind) {
         fbv = y;
         buf[i] = y;
       }
-      this.fbS[c] = fbv;
+      this.fbS[c] = fbv; this.hpS[c] = hp;
     }
   });
 
@@ -4067,7 +4069,7 @@ function defaultSeq(kind) {
       // 22..23 crackle L/R, 24..27 squelch-tail filters, 28 wobble phase, 29 band lo, 30 band hi, 31 drive gain (ramped)
       const S = this.S = new Float64Array(32);
       S[0] = 1; S[2] = 1; S[7] = 1; S[12] = 0.4 * sr; S[19] = 0.9 * sr; S[21] = 1;
-      this.dn0 = -1; this.c16 = 1 - Math.exp(-16 / (0.015 * sr));
+      this.dn0 = -1; this.c16 = 1 - Math.exp(-16 / (0.015 * sr)); this.C = new Float64Array(24);
       this.rs = 0x1f83d9ab; this.first = true;
       const K = this.K = new Float64Array(56); // per-block coefficients [0..31], sr constants [40..51]
       K[40] = 1 - Math.exp(-1 / (0.004 * sr)); K[41] = 1 - Math.exp(-1 / (0.012 * sr)); K[42] = 1 - Math.exp(-1 / (0.004 * sr));
@@ -4079,11 +4081,11 @@ function defaultSeq(kind) {
       p = this.ps.step(p, n, this.sr);
       const sr = this.sr, S = this.S;
       const dial = p.dial * 0.01, ad = Math.abs(dial);
-      // ---- band edges (log-smoothed per block); 24 dB/oct each side, shared by L/R
+      // ---- band edges (targets; _ctl glides them in the log domain and recomputes the 24 dB/oct
+      //      HP/LP coefficients every 16 samples, shared by L/R). DIAL also shifts the band.
       const fc = p.freq * Math.pow(2, dial * 0.5), bw = 0.6 + p.width * 0.044;
       const tlo = Math.log(clamp(fc * Math.pow(2, -bw / 2), 40, sr * 0.2)), thi = Math.log(clamp(fc * Math.pow(2, bw / 2), 400, sr * 0.45));
       if (this.first) { S[29] = tlo; S[30] = thi; }
-      // band edges glide inside the kernel (coefficients every 16 samples); targets here
       // ---- amounts
       const nz = p.noise * 0.01, nl = Math.pow(nz, 1.5) * 0.08 * (1 + ad) * 3.0517578125e-5, crkP = nz * 30 / sr * 65536, crkA = 1.5e-5 * nz;
       const cx = p.comp * 0.01 * 0.8;
@@ -4108,92 +4110,94 @@ function defaultSeq(kind) {
       K[20] = this.dn0; this.dn0 = dn;
       K[22] = burst; K[23] = bMean; K[24] = dMean; K[25] = thr; K[26] = holdN;
       K[27] = Math.cos(sa); K[28] = Math.sin(sa); K[29] = Math.cos(wa); K[30] = Math.sin(wa); K[31] = 0.05 * ad;
-      this._k(L, R, n);
-    }
-    // per-sample kernel (kept separate and compact so the JIT tiers it up quickly)
-    _k(L, R, n) {
-      const K = this.K, S = this.S, sr = this.sr, hL = this.hil[0], hR = this.hil[1], bs = this.bs, STEP = 16;
-      const tlo = K[0], thi = K[1], c16 = this.c16, bq = this.bq;
-      let A0 = 0, B0 = 0, C0 = 0, K0 = 0, A1 = 0, B1 = 0, C1 = 0, K1 = 0, A2 = 0, B2 = 0, C2 = 0, A3 = 0, B3 = 0, C3 = 0;
-      const nl = K[14], crkP = K[15], crkA = K[16], cx = K[17];
-      // drive gain / bias / normaliser ramp across the block
-      let dg = S[31], bias = S[6], dn = K[20];
-      const dgI = (K[18] - dg) / n, bI = (K[19] - bias) / n, dnI = (K[21] - dn) / n;
-      const burst = K[22], bMean = K[23], dMean = K[24], thr = K[25], holdN = K[26];
-      const rc = K[27], rsn = K[28], wrc = K[29], wrs = K[30], wl = K[31];
-      const gc = K[40], dc = K[41], bcf = K[42], cgc = K[43], tdec = K[44], tl = K[45], th = K[46], chopN = K[47], mk = 1.15;
-      const eia = K[48], eir = K[49], eca = K[50], ecr = K[51];
-      let oc = S[0], os = S[1], wc = S[2], ws = S[3];
-      let rs = this.rs, ei = S[4], ec = S[5], cgs = S[7], gate = S[8], tail = S[11], bEnv = S[15], chop = S[17], dG = S[21];
-      let ck0 = S[22], ck1 = S[23], t0 = S[24], t1 = S[25], t2 = S[26], t3 = S[27];
-      for (let off = 0; off < n; off += STEP) {
-        const e = Math.min(n, off + STEP);
-        // ---- control rate: band edges, squelch logic, random events, AGC gain
-        S[29] += (tlo - S[29]) * c16; S[30] += (thi - S[30]) * c16;
-        const gl = MOT_g(Math.exp(S[29]), sr), gh = MOT_g(Math.exp(S[30]), sr);
-        bq.coef(gl, 1 / 0.5412); A0 = bq.a1; B0 = bq.a2; C0 = bq.a3; K0 = bq.k;
-        bq.coef(gl, 1 / 1.3066); A1 = bq.a1; B1 = bq.a2; C1 = bq.a3; K1 = bq.k;
-        bq.coef(gh, 1 / 0.5412); A2 = bq.a1; B2 = bq.a2; C2 = bq.a3;
-        bq.coef(gh, 1 / 1.3066); A3 = bq.a1; B3 = bq.a2; C3 = bq.a3;
-        rs ^= rs << 13; rs ^= rs >>> 17; rs ^= rs << 5;
-        const uA = (rs & 0xffff) * 1.52587890625e-5, uB = (rs >>> 16) * 1.52587890625e-5;
-        const above = ei > thr * 1.4 ? 1 : 0, open0 = S[9];
-        S[10] = above ? holdN : S[10] - STEP;
-        const open = Math.max(above, open0 * Math.max(ei >= thr ? 1 : 0, S[10] > 0 ? 1 : 0));
-        tail = Math.max(tail * tdec, (open0 - open) * 0.3); S[9] = open;
-        S[12] -= STEP;
-        const bTrig = S[12] <= 0 ? 1 : 0, nbL = (0.03 + 0.35 * uA) * sr, nbV = (0.25 + 0.6 * uB) * burst, nbT = (0.3 + 1.4 * uB) * bMean + nbL;
-        S[13] = bTrig ? nbL : S[13] - STEP; S[14] = bTrig ? nbV : S[14]; S[12] = bTrig ? nbT : S[12];
-        S[18] -= STEP;
-        const cTrig = S[18] <= 0 ? 1 : 0, ncT = uA * uA, ncC = chopN * (1 + 2 * uB);
-        S[16] = cTrig ? ncT : S[16]; S[18] = cTrig ? ncC : S[18];
-        S[19] -= STEP;
-        const dTrig = S[19] <= 0 ? 1 : 0, ndL = (0.05 + 0.45 * uB) * sr, ndT = (0.3 + 1.4 * uA) * dMean + ndL;
-        S[20] = dTrig ? ndL : S[20] - STEP; S[19] = dTrig ? ndT : S[19];
-        const bOn = S[13] > 0 ? 1 : 0, dOn = S[20] > 0 ? 1 : 0, bLvl = S[14], chT = S[16];
-        const cg = Math.max(0.1, Math.min(3, Math.pow(0.35 / (ec + 0.003), cx)));
-        const dT = 1 - 0.97 * dOn, tn = tail * 3.0517578125e-5;
-        for (let i = off; i < e; i++) {
-          const xl0 = L[i], xr0 = R[i];
-          const ain = Math.max(Math.abs(xl0), Math.abs(xr0));
-          ei = ain + (ain > ei ? eia : eir) * (ei - ain);
-          gate += (open - gate) * gc;
-          bEnv += (bOn - bEnv) * bcf; chop += (chT - chop) * bcf; dG += (dT - dG) * dc;
-          rs ^= rs << 13; rs ^= rs >>> 17; rs ^= rs << 5;
-          const na = (rs & 0xffff) - 32768, nb = (rs >>> 16) - 32768;
-          const ck = (rs & 0xffff) * 0.37 + (rs >>> 16) * 0.63 < crkP ? 1 : 0;
-          ck0 = ck0 * 0.6 + ck * na * crkA; ck1 = ck1 * 0.6 + ck * nb * crkA;
-          const nn = nl + bEnv * bLvl * chop * 3.0517578125e-5, sigG = dG * (1 - 0.6 * bEnv);
-          // signal + noise -> 24 dB/oct band-pass
-          let xl = xl0 * sigG + na * nn + ck0, xr = xr0 * sigG + nb * nn + ck1;
-          let v3 = xl - bs[1], v1 = A0 * bs[0] + B0 * v3, v2 = bs[1] + B0 * bs[0] + C0 * v3; bs[0] = 2 * v1 - bs[0]; bs[1] = 2 * v2 - bs[1]; xl = xl - K0 * v1 - v2;
-          v3 = xl - bs[3]; v1 = A1 * bs[2] + B1 * v3; v2 = bs[3] + B1 * bs[2] + C1 * v3; bs[2] = 2 * v1 - bs[2]; bs[3] = 2 * v2 - bs[3]; xl = xl - K1 * v1 - v2;
-          v3 = xl - bs[5]; v1 = A2 * bs[4] + B2 * v3; v2 = bs[5] + B2 * bs[4] + C2 * v3; bs[4] = 2 * v1 - bs[4]; bs[5] = 2 * v2 - bs[5]; xl = v2;
-          v3 = xl - bs[7]; v1 = A3 * bs[6] + B3 * v3; v2 = bs[7] + B3 * bs[6] + C3 * v3; bs[6] = 2 * v1 - bs[6]; bs[7] = 2 * v2 - bs[7]; xl = v2;
-          v3 = xr - bs[9]; v1 = A0 * bs[8] + B0 * v3; v2 = bs[9] + B0 * bs[8] + C0 * v3; bs[8] = 2 * v1 - bs[8]; bs[9] = 2 * v2 - bs[9]; xr = xr - K0 * v1 - v2;
-          v3 = xr - bs[11]; v1 = A1 * bs[10] + B1 * v3; v2 = bs[11] + B1 * bs[10] + C1 * v3; bs[10] = 2 * v1 - bs[10]; bs[11] = 2 * v2 - bs[11]; xr = xr - K1 * v1 - v2;
-          v3 = xr - bs[13]; v1 = A2 * bs[12] + B2 * v3; v2 = bs[13] + B2 * bs[12] + C2 * v3; bs[12] = 2 * v1 - bs[12]; bs[13] = 2 * v2 - bs[13]; xr = v2;
-          v3 = xr - bs[15]; v1 = A3 * bs[14] + B3 * v3; v2 = bs[15] + B3 * bs[14] + C3 * v3; bs[14] = 2 * v1 - bs[14]; bs[15] = 2 * v2 - bs[15]; xr = v2;
-          // DIAL: single-sideband mistuning (always running; zero shift = allpass)
-          let t = oc * rc - os * rsn; os = os * rc + oc * rsn; oc = t;
-          hL.process(xl); hR.process(xr);
-          xl = hL.re * oc - hL.im * os; xr = hR.re * oc - hR.im * os;
-          // AGC follower, detector drive, heterodyne whistle, squelch gate + tail
-          const ab = Math.abs(xl) + Math.abs(xr);
-          ec = ab + (ab > ec ? eca : ecr) * (ec - ab);
-          cgs += (cg - cgs) * cgc;
-          t = wc * wrc - ws * wrs; ws = ws * wrc + wc * wrs; wc = t;
-          const wv = ws * wl * Math.min(1, ec * 6), gg = gate * mk;
-          t0 += tl * (na * tn - t0); t1 += th * (t0 - t1); t2 += tl * (nb * tn - t2); t3 += th * (t2 - t3);
-          dg += dgI; bias += bI; dn += dnI;
-          const tb = MOT_tanh(bias);
-          L[i] = ((MOT_tanh(dg * xl * cgs + bias) - tb) * dn + wv) * gg + t0 - t1;
-          R[i] = ((MOT_tanh(dg * xr * cgs + bias) - tb) * dn + wv) * gg + t2 - t3;
-        }
-      }
-      S[0] = oc; S[1] = os; S[2] = wc; S[3] = ws; S[4] = ei; S[5] = ec; S[7] = cgs; S[8] = gate; S[11] = tail;
-      S[15] = bEnv; S[17] = chop; S[21] = dG; S[22] = ck0; S[23] = ck1; S[24] = t0; S[25] = t1; S[26] = t2; S[27] = t3;
+      // drive stage ramps (evaluated per sample in the kernel)
+      K[32] = S[31]; K[33] = (dg - S[31]) / n; K[34] = S[6]; K[35] = (bias - S[6]) / n; K[36] = K[20]; K[37] = (dn - K[20]) / n;
       S[31] = dg; S[6] = bias;
+      for (let off = 0; off < n; off += 16) {
+        this._ctl();
+        this._k(L, R, off, Math.min(n, off + 16));
+      }
+    }
+    // control rate (every 16 samples): band coefficients, squelch, random events, AGC gain -> this.C
+    _ctl() {
+      const K = this.K, S = this.S, C = this.C, sr = this.sr, bq = this.bq, STEP = 16;
+      S[29] += (K[0] - S[29]) * this.c16; S[30] += (K[1] - S[30]) * this.c16;
+      const gl = MOT_g(Math.exp(S[29]), sr), gh = MOT_g(Math.exp(S[30]), sr);
+      bq.coef(gl, 1 / 0.5412); C[0] = bq.a1; C[1] = bq.a2; C[2] = bq.a3; C[3] = bq.k;
+      bq.coef(gl, 1 / 1.3066); C[4] = bq.a1; C[5] = bq.a2; C[6] = bq.a3; C[7] = bq.k;
+      bq.coef(gh, 1 / 0.5412); C[8] = bq.a1; C[9] = bq.a2; C[10] = bq.a3;
+      bq.coef(gh, 1 / 1.3066); C[11] = bq.a1; C[12] = bq.a2; C[13] = bq.a3;
+      let rs = this.rs; rs ^= rs << 13; rs ^= rs >>> 17; rs ^= rs << 5; this.rs = rs;
+      const uA = (rs & 0xffff) * 1.52587890625e-5, uB = (rs >>> 16) * 1.52587890625e-5;
+      // squelch: hysteresis + hold; a closing gate fires the squelch tail
+      const thr = K[25], ei = S[4], above = ei > thr * 1.4 ? 1 : 0, open0 = S[9];
+      S[10] = above ? K[26] : S[10] - STEP;
+      const open = Math.max(above, open0 * Math.max(ei >= thr ? 1 : 0, S[10] > 0 ? 1 : 0));
+      S[11] = Math.max(S[11] * K[44], (open0 - open) * 0.3); S[9] = open;
+      // events: countdowns re-armed branch-free (static bursts, chop, dropouts)
+      const burst = K[22], bMean = K[23], dMean = K[24];
+      S[12] -= STEP;
+      const bTrig = S[12] <= 0 ? 1 : 0, nbL = (0.03 + 0.35 * uA) * sr, nbV = (0.25 + 0.6 * uB) * burst, nbT = (0.3 + 1.4 * uB) * bMean + nbL;
+      S[13] = bTrig ? nbL : S[13] - STEP; S[14] = bTrig ? nbV : S[14]; S[12] = bTrig ? nbT : S[12];
+      S[18] -= STEP;
+      const cTrig = S[18] <= 0 ? 1 : 0, ncT = uA * uA, ncC = K[47] * (1 + 2 * uB);
+      S[16] = cTrig ? ncT : S[16]; S[18] = cTrig ? ncC : S[18];
+      S[19] -= STEP;
+      const dTrig = S[19] <= 0 ? 1 : 0, ndL = (0.05 + 0.45 * uB) * sr, ndT = (0.3 + 1.4 * uA) * dMean + ndL;
+      S[20] = dTrig ? ndL : S[20] - STEP; S[19] = dTrig ? ndT : S[19];
+      C[14] = open; C[15] = S[13] > 0 ? 1 : 0; C[16] = 1 - 0.97 * (S[20] > 0 ? 1 : 0); C[17] = S[14]; C[18] = S[16];
+      C[19] = Math.max(0.1, Math.min(3, Math.pow(0.35 / (S[5] + 0.003), K[17]))); C[20] = S[11] * 3.0517578125e-5;
+    }
+    // per-sample kernel (compact so the JIT tiers it up quickly)
+    _k(L, R, i0, i1) {
+      const K = this.K, S = this.S, C = this.C, hL = this.hil[0], hR = this.hil[1], bs = this.bs;
+      const A0 = C[0], B0 = C[1], C0 = C[2], K0 = C[3], A1 = C[4], B1 = C[5], C1 = C[6], K1 = C[7];
+      const A2 = C[8], B2 = C[9], C2 = C[10], A3 = C[11], B3 = C[12], C3 = C[13];
+      const open = C[14], bOn = C[15], dT = C[16], bLvl = C[17], chT = C[18], cg = C[19], tn = C[20];
+      const nl = K[14], crkP = K[15], crkA = K[16], rc = K[27], rsn = K[28], wrc = K[29], wrs = K[30], wl = K[31];
+      const dg0 = K[32], dgI = K[33], bi0 = K[34], bI = K[35], dn0 = K[36], dnI = K[37];
+      const gc = K[40], dc = K[41], bcf = K[42], cgc = K[43], tl = K[45], th = K[46], mk = 1.15;
+      const eia = K[48], eir = K[49], eca = K[50], ecr = K[51];
+      let oc = S[0], os = S[1], wc = S[2], ws = S[3], ei = S[4], ec = S[5], cgs = S[7], gate = S[8];
+      let bEnv = S[15], chop = S[17], dG = S[21], ck0 = S[22], ck1 = S[23], t0 = S[24], t1 = S[25], t2 = S[26], t3 = S[27], rs = this.rs;
+      for (let i = i0; i < i1; i++) {
+        const xl0 = L[i], xr0 = R[i];
+        const ain = Math.max(Math.abs(xl0), Math.abs(xr0));
+        ei = ain + (ain > ei ? eia : eir) * (ei - ain);
+        gate += (open - gate) * gc;
+        bEnv += (bOn - bEnv) * bcf; chop += (chT - chop) * bcf; dG += (dT - dG) * dc;
+        rs ^= rs << 13; rs ^= rs >>> 17; rs ^= rs << 5;
+        const na = (rs & 0xffff) - 32768, nb = (rs >>> 16) - 32768;
+        const ck = (rs & 0xffff) * 0.37 + (rs >>> 16) * 0.63 < crkP ? 1 : 0;
+        ck0 = ck0 * 0.6 + ck * na * crkA; ck1 = ck1 * 0.6 + ck * nb * crkA;
+        const nn = nl + bEnv * bLvl * chop * 3.0517578125e-5, sigG = dG * (1 - 0.6 * bEnv);
+        // signal + noise -> 24 dB/oct band-pass
+        let xl = xl0 * sigG + na * nn + ck0, xr = xr0 * sigG + nb * nn + ck1;
+        let v3 = xl - bs[1], v1 = A0 * bs[0] + B0 * v3, v2 = bs[1] + B0 * bs[0] + C0 * v3; bs[0] = 2 * v1 - bs[0]; bs[1] = 2 * v2 - bs[1]; xl = xl - K0 * v1 - v2;
+        v3 = xl - bs[3]; v1 = A1 * bs[2] + B1 * v3; v2 = bs[3] + B1 * bs[2] + C1 * v3; bs[2] = 2 * v1 - bs[2]; bs[3] = 2 * v2 - bs[3]; xl = xl - K1 * v1 - v2;
+        v3 = xl - bs[5]; v1 = A2 * bs[4] + B2 * v3; v2 = bs[5] + B2 * bs[4] + C2 * v3; bs[4] = 2 * v1 - bs[4]; bs[5] = 2 * v2 - bs[5]; xl = v2;
+        v3 = xl - bs[7]; v1 = A3 * bs[6] + B3 * v3; v2 = bs[7] + B3 * bs[6] + C3 * v3; bs[6] = 2 * v1 - bs[6]; bs[7] = 2 * v2 - bs[7]; xl = v2;
+        v3 = xr - bs[9]; v1 = A0 * bs[8] + B0 * v3; v2 = bs[9] + B0 * bs[8] + C0 * v3; bs[8] = 2 * v1 - bs[8]; bs[9] = 2 * v2 - bs[9]; xr = xr - K0 * v1 - v2;
+        v3 = xr - bs[11]; v1 = A1 * bs[10] + B1 * v3; v2 = bs[11] + B1 * bs[10] + C1 * v3; bs[10] = 2 * v1 - bs[10]; bs[11] = 2 * v2 - bs[11]; xr = xr - K1 * v1 - v2;
+        v3 = xr - bs[13]; v1 = A2 * bs[12] + B2 * v3; v2 = bs[13] + B2 * bs[12] + C2 * v3; bs[12] = 2 * v1 - bs[12]; bs[13] = 2 * v2 - bs[13]; xr = v2;
+        v3 = xr - bs[15]; v1 = A3 * bs[14] + B3 * v3; v2 = bs[15] + B3 * bs[14] + C3 * v3; bs[14] = 2 * v1 - bs[14]; bs[15] = 2 * v2 - bs[15]; xr = v2;
+        // DIAL: single-sideband mistuning (always running; zero shift = allpass)
+        let t = oc * rc - os * rsn; os = os * rc + oc * rsn; oc = t;
+        hL.process(xl); hR.process(xr);
+        xl = hL.re * oc - hL.im * os; xr = hR.re * oc - hR.im * os;
+        // AGC follower, detector drive, heterodyne whistle, squelch gate + tail
+        const ab = Math.abs(xl) + Math.abs(xr);
+        ec = ab + (ab > ec ? eca : ecr) * (ec - ab);
+        cgs += (cg - cgs) * cgc;
+        t = wc * wrc - ws * wrs; ws = ws * wrc + wc * wrs; wc = t;
+        const wv = ws * wl * Math.min(1, ec * 6), gg = gate * mk;
+        t0 += tl * (na * tn - t0); t1 += th * (t0 - t1); t2 += tl * (nb * tn - t2); t3 += th * (t2 - t3);
+        const j = i + 1, dg = dg0 + dgI * j, bias = bi0 + bI * j, dn = dn0 + dnI * j, tb = MOT_tanh(bias);
+        L[i] = ((MOT_tanh(dg * xl * cgs + bias) - tb) * dn + wv) * gg + t0 - t1;
+        R[i] = ((MOT_tanh(dg * xr * cgs + bias) - tb) * dn + wv) * gg + t2 - t3;
+      }
+      S[0] = oc; S[1] = os; S[2] = wc; S[3] = ws; S[4] = ei; S[5] = ec; S[7] = cgs; S[8] = gate;
+      S[15] = bEnv; S[17] = chop; S[21] = dG; S[22] = ck0; S[23] = ck1; S[24] = t0; S[25] = t1; S[26] = t2; S[27] = t3;
       this.rs = rs;
     }
   });
@@ -9431,6 +9435,20 @@ function FxCard(id) {
   head.addEventListener('dragstart', (e) => { e.dataTransfer.setData('text/plain', 'move:' + id); e.dataTransfer.effectAllowed = 'move'; card.classList.add('dragging'); });
   head.addEventListener('dragend', () => card.classList.remove('dragging'));
   const own = keys.slice(3).map((k) => Ctl(k));
+  // effects with a SYNC toggle: show either the tempo divisions or the free rate/time
+  const syncKey = 'fx.' + id + '.sync';
+  if (DEFS[syncKey] && DEFS[syncKey].d.kind === 'toggle') {
+    const freeIds = ['rate', 'ms', 'hz'];
+    const upd = () => {
+      const on = P[syncKey] >= 0.5;
+      keys.slice(3).forEach((k, i) => {
+        const d = DEFS[k].d;
+        if (d.kind === 'div') own[i].hidden = !on;
+        else if (d.kind === 'num' && freeIds.includes(d.id) && keys.some((q) => DEFS[q].d.kind === 'div')) own[i].hidden = on;
+      });
+    };
+    onKey(syncKey, upd);
+  }
   const body = h('div', { class: 'fx-body' }, h('div', { class: 'kgrid' }, ...own), h('div', { class: 'fx-host' }, Knob('fx.' + id + '.mix'), Knob('fx.' + id + '.gain')));
   const card = h('article', { class: 'fx-card', id: 'fx-' + id, style: { '--cat': `var(--c-${m.cat.toLowerCase()})` } }, head, h('p', { class: 'fx-desc' }, m.desc), body);
   onKey('fx.' + id + '.on', () => card.classList.toggle('is-off', P['fx.' + id + '.on'] < 0.5));
@@ -10100,6 +10118,7 @@ function definePresets() {
   }, { chain: ['ensemble', 'spring'], loop: 'arp', slots: [slot('m1', 'vari.mode', 'FORWARD', 'REVERSE'), slot('lfo1', 'fx.ensemble.depth', 20, 90)] }));
 
   factory('GRAIN CHOIR', 'AMBIENT', P_({
+    'main.gain': 5, 
     'stretch.on': 1, 'stretch.speed': 25, 'stretch.pitch': 7, 'stretch.grain': '1/64', 'stretch.spread': 100, 'stretch.mix': 60,
     ...fxp('harmony', { v1: 2, v2: 4 }), 'fx.harmony.mix': 50,
     ...fxp('plate', { size: 85, decay: 80 }), 'fx.plate.mix': 40,
@@ -10115,6 +10134,7 @@ function definePresets() {
   }, { chain: ['clip', 'mauler', 'multifilter'], loop: 'break', slots: [slot('lfo4', 'fx.multifilter.cutoff', 300, 7000), slot('m1', 'fx.clip.drive', 0, 30)] }));
 
   factory('SPECTRAL GHOST', 'SPECTRAL', P_({
+    'main.gain': 10, 
     'stretch.on': 1, 'stretch.speed': 40, 'stretch.mix': 70,
     ...fxp('smear', { smear: 70 }),
     ...fxp('snapshot', {}), 'fx.snapshot.mix': 55,
@@ -10129,6 +10149,7 @@ function definePresets() {
   }, { chain: ['codec', 'radio', 'gate'], loop: 'keys', slots: [slot('lfo2', 'fx.radio.dial', 0, 60), slot('m1', 'fx.codec.packet', 0, 70)] }));
 
   factory('HARMONIC SHIMMER', 'TONAL', P_({
+    'main.gain': 4, 
     'stutter.on': 1, 'stutter.capture': '1/1', 'stutter.rate': '1/8', 'stutter.ramp': 5, 'stutter.decay': 30, 'stutter.mix': 60,
     ...fxp('resonate', { focus: 60 }), 'fx.resonate.mix': 55,
     ...fxp('harp', {}), 'fx.harp.mix': 45,
@@ -10140,5 +10161,22 @@ function definePresets() {
     ...fxp('memory', {}), ...fxp('slicer', {}), 'fx.slicer.mix': 70,
     ...fxp('echotape', { fdbk: 55 }), 'fx.echotape.mix': 30,
   }, { chain: ['slicer', 'memory', 'echotape'], loop: 'break', slots: [slot('m1', 'fx.slicer.shuffle', 0, 100)] }));
+
+  factory('BARBER POLE', 'MOTION', P_({
+    'main.gain': 6, 
+    'stretch.on': 1, 'stretch.speed': 35, 'stretch.spread': 60, 'stretch.mix': 80,
+    ...fxp('phaser', { barber: 'RISE', depth: 70, fdbk: 55, stages: 8 }),
+    ...fxp('flanger', { barber: 'FALL', depth: 60, fdbk: 40 }), 'fx.flanger.mix': 45,
+    ...fxp('echotape', { timel: '1/8D', timer: '1/4', fdbk: 40 }), 'fx.echotape.mix': 30,
+  }, { chain: ['phaser', 'flanger', 'echotape'], loop: 'choir', slots: [slot('m1', 'fx.phaser.fdbk', 20, 85), slot('lfo1', 'stretch.speed', 15, 60)] }));
+
+  factory('FLYBY DUB', 'MOTION', P_({
+    'main.gain': 7, 
+    'stutter.on': 1, 'stutter.prob': 35, 'stutter.capture': '1/1', 'stutter.rate': '1/8', 'stutter.decay': 40,
+    ...fxp('doppler', { path: 'ORBIT', distance: 12, depth: 70 }),
+    ...fxp('multihead', { heads: 3, fdbk: 55, halo: 40 }), 'fx.multihead.mix': 40,
+    ...fxp('multifilter', { cutoff: 1400, res: 35, mode: 'BP' }), 'fx.multifilter.mix': 70,
+    ...fxp('plate', { size: 70, decay: 55 }), 'fx.plate.mix': 25,
+  }, { chain: ['multifilter', 'doppler', 'multihead', 'plate'], loop: 'arp', slots: [slot('graph3', 'fx.multifilter.cutoff', 400, 4000), slot('x', 'fx.doppler.depth', 10, 100), slot('y', 'fx.multihead.fdbk', 20, 85)] }));
 }
 </script>
