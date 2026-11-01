@@ -4,7 +4,9 @@ A browser instrument that turns one audio loop into a performance. Built from th
 functional research briefing in [`docs/briefing.md`](docs/briefing.md) as an
 independent Web Audio implementation with its own name, DSP, UI and presets.
 
-**Open `dist/index.html`** in a current Chromium, Firefox or Safari and press PLAY.
+**Live:** https://hanshaller1.github.io/da_fiasco/ (GitHub Pages, branch root).
+
+**Open `index.html`** (or `dist/index.html`) in a current Chromium, Firefox or Safari and press PLAY.
 Over `http(s)://` the DSP runs in an AudioWorklet; from `file://` it falls back to a
 ScriptProcessor running the same engine on the main thread.
 

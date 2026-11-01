@@ -1,6 +1,7 @@
 // Build: inline CSS, DSP sources and UI scripts into one HTML file.
 //   dist/index.html     full standalone document (open locally or host anywhere)
 //   dist/artifact.html  body fragment for hosts that add their own <html>/<head> skeleton
+//   index.html          copy of dist/index.html at the repo root for GitHub Pages
 // Usage: node tools/build.mjs
 import fs from 'node:fs';
 import path from 'node:path';
@@ -40,4 +41,7 @@ ${frag}
 fs.mkdirSync(path.join(root, 'dist'), { recursive: true });
 fs.writeFileSync(path.join(root, 'dist/index.html'), full);
 fs.writeFileSync(path.join(root, 'dist/artifact.html'), frag);
+// GitHub Pages serves index.html from the repository root: publish the app there too
+fs.writeFileSync(path.join(root, 'index.html'), full);
+fs.writeFileSync(path.join(root, '.nojekyll'), '');
 console.log(`dist/index.html ${(full.length / 1024).toFixed(0)} KB · fx banks: ${fxFiles.join(', ') || 'none'}`);
