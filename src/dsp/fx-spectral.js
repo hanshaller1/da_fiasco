@@ -477,7 +477,7 @@
     static latency = 2048;
     static params = [
       { id: 'center', label: 'CENTER', min: 40, max: 16000, def: 900, curve: 'exp', unit: 'Hz' },
-      { id: 'gain', label: 'GAIN', min: -30, max: 18, def: 12, unit: 'dB', bipolar: true },
+      { id: 'bgain', label: 'BAND GAIN', min: -30, max: 18, def: 12, unit: 'dB', bipolar: true },
       { id: 'width', label: 'WIDTH', min: 0.2, max: 8, def: 1.2, curve: 'exp' },
       { id: 'tilt', label: 'TILT', min: -6, max: 6, def: 0, unit: 'dB', bipolar: true },
       { id: 'warp', label: 'WARP', min: -12, max: 12, def: 0, unit: 'st', bipolar: true },
@@ -493,7 +493,7 @@
     }
     onClear() { this.st.pv.clear(); }
     block(p) {
-      this.center = p.center; this.gain = p.gain; this.sig = Math.max(0.05, p.width / 2.355);
+      this.center = p.center; this.gain = p.bgain; this.sig = Math.max(0.05, p.width / 2.355);
       this.tilt = p.tilt; this.warp = p.warp / 12; this.gateOn = p.gate > -89.5;
       this.thr = Math.pow(10, p.gate / 20) * this.N * 0.25;
       this.scan = p.scan >= 0.5; this.srate = Math.max(1 / 32, p.srate); this.sdepth = p.sdepth;
@@ -966,16 +966,23 @@
       { id: 'mixin', label: 'MIX-IN', min: 0, max: 100, def: 0, unit: '%' },
       { id: 'morph', label: 'MORPH', min: 0, max: 100, def: 15, unit: '%' },
     ];
-    setup() { this.cM = new Float64Array(3).fill(NaN); this.step = NaN; this.cap = false; this.mx = new Float32Array(2); this.pSt = new Float64Array(2); this.remap = false; }
+    setup() {
+      this.cM = new Float64Array(3).fill(NaN); this.step = NaN; this.cap = false;
+      this.mx = new Float32Array(2); this.pSt = new Float64Array(2); this.roDirty = new Uint8Array(2); this.remap = false;
+    }
     alloc(N) {
-      const B = N / 2 + 1, F = () => new Float32Array(B), D = () => new Float64Array(B);
+      const B = N / 2 + 1, F = () => new Float32Array(B), F2 = () => [F(), F()];
       return {
-        pRe: [F(), F()], pIm: [F(), F()], St: [F(), F()], Ms: [F(), F()], Mo: [F(), F()], Fq: [F(), F()],
-        Ps: [D(), D()], Po: [D(), D()], lm: [new Uint8Array(B), new Uint8Array(B)],
-        X: F(), C: F(), W: F(), Phi: F(), src: F(), rat: F(), sel: new Uint8Array(B), pk: new Int32Array(B),
+        pRe: F2(), pIm: F2(), St: F2(), Ms: F2(), Mo: F2(),
+        Wa: F2(),                  // captured true phase advance per hop (rad, unwrapped)
+        Rr: F2(), Ri: F2(),        // rotation phasor per hop
+        Ur: F2(), Ui: F2(),        // running output phasor
+        Or: F2(), Oi: F2(), Qr: F2(), Qi: F2(), // remap: per-output-bin rotation / running phasor
+        lm: [new Uint8Array(B), new Uint8Array(B)],
+        X: F(), C: F(), src: F(), rat: F(), sel: new Uint8Array(B), pk: new Int32Array(B),
       };
     }
-    onClear() { this.step = NaN; this.cap = false; this.mx.fill(1); this.pSt.fill(0); this.cM[0] = NaN; }
+    onClear() { this.step = NaN; this.cap = false; this.mx.fill(1); this.pSt.fill(0); this.cM[0] = NaN; this.roDirty.fill(1); }
     block(p, ctx) {
       this.slice = Math.max(1 / 64, p.slice);
       this.blur = p.blur / 100; this.V = SPX_VOICES[clamp(p.voices | 0, 0, 13)];
@@ -986,21 +993,29 @@
       this.remap = oct !== 0 || Math.abs(te) > 0.005;
       if (this.remap && (c[0] !== oct || c[1] !== te || c[2] !== this.N)) {
         c[0] = oct; c[1] = te; c[2] = this.N;
-        const src = this.st.src, rat = this.st.rat, B = this.B, e = 1 + 0.25 * te, ie = 1 / e, fr = 200 * this.N / this.sr, o2 = Math.pow(2, oct);
+        const src = this.st.src, rat = this.st.rat, B = this.B, ie = 1 / (1 + 0.25 * te), fr = 200 * this.N / this.sr, o2 = Math.pow(2, oct);
         for (let j = 0; j < B; j++) {
           const s = j < 1 ? -1 : fr * Math.pow(j / (o2 * fr), ie);
           src[j] = s; rat[j] = s > 0 ? j / s : 0;
         }
+        this.roDirty.fill(1);
       }
     }
-    capture(re, im, ch) {
-      const st = this.st, B = this.B, X = st.X, C = st.C, W = st.W, Phi = st.Phi, pRe = st.pRe[ch], pIm = st.pIm[ch];
-      const St = st.St[ch], Mo = st.Mo[ch], Ms = st.Ms[ch], Fq = st.Fq[ch], Ps = st.Ps[ch], lm = st.lm[ch], V = this.V, fb = this.fb;
-      for (let k = 0; k < B; k++) {
-        const a = re[k], b = im[k], c = pRe[k], d = pIm[k];
-        let dev = Math.atan2(b * c - a * d, a * c + b * d) - k * SPX_HP; dev -= TAU * Math.round(dev / TAU);
-        W[k] = k * SPX_HP + dev; Phi[k] = Math.atan2(b, a);
+    // per-output-bin rotation for the remapped resynthesis (only after a capture or remap change)
+    buildRot(ch) {
+      const st = this.st, B = this.B, src = st.src, rat = st.rat, Wa = st.Wa[ch], Or = st.Or[ch], Oi = st.Oi[ch];
+      for (let j = 0; j < B; j++) {
+        const s = src[j];
+        if (s < 0 || s >= B - 1) { Or[j] = 1; Oi[j] = 0; continue; }
+        const i = s | 0, f = s - i, a = (Wa[i] + (Wa[i + 1] - Wa[i]) * f) * rat[j];
+        Or[j] = Math.cos(a); Oi[j] = Math.sin(a);
       }
+      this.roDirty[ch] = 0;
+    }
+    capture(re, im, ch) {
+      const st = this.st, B = this.B, X = st.X, C = st.C, pRe = st.pRe[ch], pIm = st.pIm[ch];
+      const St = st.St[ch], Mo = st.Mo[ch], Ms = st.Ms[ch], Wa = st.Wa[ch], Rr = st.Rr[ch], Ri = st.Ri[ch], Ur = st.Ur[ch], Ui = st.Ui[ch];
+      const lm = st.lm[ch], V = this.V, fb = this.fb;
       if (V === 0) C.set(X);
       else {
         C.fill(0);
@@ -1011,34 +1026,43 @@
           let bi = -1, bm = 0;
           for (let i = 0; i < np; i++) { const q = pk[i]; if (!sel[q] && X[q] > bm) { bm = X[q]; bi = q; } }
           if (bi < 0) break;
-          sel[bi] = 1;
-          const wp = W[bi];
-          for (let k = bi - 2; k <= bi + 2; k++) { C[k] = X[k]; W[k] = wp; }
+          sel[bi] = 2;
+          for (let k = bi - 2; k <= bi + 2; k++) { C[k] = X[k]; if (k !== bi) sel[k] = 1; }
         }
       }
       let Pc = 0, Po = 0, Pt = 0;
       for (let k = 0; k < B; k++) {
-        const cv = C[k], ov = fb * Mo[k];
-        Pc += cv * cv; Po += Mo[k] * Mo[k];
+        const cv = C[k], mo = Mo[k], ov = fb * mo;
+        Pc += cv * cv; Po += mo * mo;
         const s = Math.sqrt(cv * cv + ov * ov);
-        St[k] = s; Pt += s * s;
-        if (cv >= ov && cv > 0) { Fq[k] = W[k]; Ps[k] = Phi[k]; }
-        lm[k] = s > 0 ? 1 : 0;
+        St[k] = s; Pt += s * s; lm[k] = s > 0 ? 1 : 0;
+        if (cv > 0 && cv >= ov) {
+          const a = re[k], b = im[k], c = pRe[k], d = pIm[k];
+          let dev = Math.atan2(b * c - a * d, a * c + b * d) - k * SPX_HP; dev -= TAU * Math.round(dev / TAU);
+          Wa[k] = k * SPX_HP + dev; Rr[k] = Math.cos(dev + k * SPX_HP); Ri[k] = Math.sin(dev + k * SPX_HP);
+          const iX = 1 / X[k]; Ur[k] = a * iX; Ui[k] = b * iX;
+        }
+      }
+      if (V !== 0) {
+        // lobe bins advance with their peak so each voice stays a coherent sinusoid
+        const sel = st.sel;
+        for (let k = 2; k < B - 2; k++) if (sel[k] === 2) for (let j = k - 2; j <= k + 2; j++) if (j !== k && C[j] >= fb * Mo[j]) { Wa[j] = Wa[k]; Rr[j] = Rr[k]; Ri[j] = Ri[k]; }
       }
       const tgt = Math.max(Pc, fb * Po);
       if (Pt > tgt && Pt > 0) { const sc = Math.sqrt(tgt / Pt); for (let k = 0; k < B; k++) St[k] *= sc; Pt = tgt; }
       this.pSt[ch] = Pt;
-      Ms.set(Mo); this.mx[ch] = 0;
+      Ms.set(Mo); this.mx[ch] = 0; this.roDirty[ch] = 1;
     }
     frame(re, im, ch) {
-      const st = this.st, B = this.B, X = st.X, rng = this.rng;
+      const st = this.st, B = this.B, X = st.X, rng = this.rng, RT = SPX_RT;
       let pl = 0;
       for (let k = 0; k < B; k++) { const v = re[k] * re[k] + im[k] * im[k]; X[k] = Math.sqrt(v); pl += v; }
       if (ch === 0) {
         const step = Math.floor(this.framePPQ() / this.slice);
         this.cap = step !== this.step; this.step = step;
       }
-      const St = st.St[ch], Ms = st.Ms[ch], Mo = st.Mo[ch], Fq = st.Fq[ch], Ps = st.Ps[ch], lm = st.lm[ch];
+      const St = st.St[ch], Ms = st.Ms[ch], Mo = st.Mo[ch], lm = st.lm[ch];
+      // capture on the grid, or as soon as signal appears after silence
       if (this.cap || (this.pSt[ch] < 1e-3 * pl && pl > 1e-8 * this.N * this.N)) this.capture(re, im, ch);
       else if (this.mi > 0) {
         const mi = this.mi, all = this.V === 0; let pt = 0;
@@ -1053,22 +1077,33 @@
       } else Mo.set(St);
       const pRe = st.pRe[ch], pIm = st.pIm[ch];
       for (let k = 0; k < B; k++) { pRe[k] = re[k]; pIm[k] = im[k]; }
-      const bz = this.blur * Math.PI;
+      const bz = this.blur;
       if (!this.remap) {
+        const Rr = st.Rr[ch], Ri = st.Ri[ch], Ur = st.Ur[ch], Ui = st.Ui[ch];
         for (let k = 0; k < B; k++) {
-          let q = Ps[k] + Fq[k]; if (bz > 0) q += bz * rng.bi(); q -= TAU * Math.round(q / TAU); Ps[k] = q;
-          const m = Mo[k]; re[k] = m * Math.cos(q); im[k] = m * Math.sin(q);
+          const qr = Ur[k], qi = Ui[k], xr = Rr[k], xi = Ri[k];
+          let or = qr * xr - qi * xi, oi = qr * xi + qi * xr;
+          if (bz > 0) { const j = SPX_ri(rng, bz), cr = RT[j], ci = RT[j + 1], t = or * cr - oi * ci; oi = or * ci + oi * cr; or = t; }
+          const n = or * or + oi * oi;
+          if (n < 0.25) { or = 1; oi = 0; } else { const g = (3 - n) * 0.5; or *= g; oi *= g; }
+          Ur[k] = or; Ui[k] = oi;
+          const m = Mo[k]; re[k] = m * or; im[k] = m * oi;
         }
       } else {
-        const src = st.src, rat = st.rat, Po = st.Po[ch];
+        if (this.roDirty[ch]) this.buildRot(ch);
+        const src = st.src, rat = st.rat, Or = st.Or[ch], Oi = st.Oi[ch], Qr = st.Qr[ch], Qi = st.Qi[ch];
         for (let j = 0; j < B; j++) {
           const s = src[j];
           if (s < 0 || s >= B - 1) { re[j] = 0; im[j] = 0; continue; }
-          const i = s | 0, f = s - i, rt = rat[j];
-          const m = (Mo[i] + (Mo[i + 1] - Mo[i]) * f) / Math.sqrt(rt);
-          let q = Po[j] + (Fq[i] + (Fq[i + 1] - Fq[i]) * f) * rt; if (bz > 0) q += bz * rng.bi();
-          q -= TAU * Math.round(q / TAU); Po[j] = q;
-          re[j] = m * Math.cos(q); im[j] = m * Math.sin(q);
+          const i = s | 0, f = s - i;
+          const m = (Mo[i] + (Mo[i + 1] - Mo[i]) * f) / Math.sqrt(rat[j]);
+          const qr = Qr[j], qi = Qi[j], xr = Or[j], xi = Oi[j];
+          let or = qr * xr - qi * xi, oi = qr * xi + qi * xr;
+          if (bz > 0) { const r = SPX_ri(rng, bz), cr = RT[r], ci = RT[r + 1], t = or * cr - oi * ci; oi = or * ci + oi * cr; or = t; }
+          const n = or * or + oi * oi;
+          if (n < 0.25) { or = 1; oi = 0; } else { const g = (3 - n) * 0.5; or *= g; oi *= g; }
+          Qr[j] = or; Qi[j] = oi;
+          re[j] = m * or; im[j] = m * oi;
         }
       }
     }
@@ -1077,7 +1112,6 @@
   // ==========================================================================
   // 10. FORMSHIFT — formant (spectral envelope) shift, pitch preserved
   // ==========================================================================
-  const SPX_F512 = new FFT(512);
   registerFX(class extends SPX_Base {
     static id = 'formshift';
     static label = 'FORMSHIFT';
@@ -1091,44 +1125,55 @@
       { id: 'spread', label: 'SPREAD', min: 0, max: 6, def: 0, unit: 'st' },
       { id: 'size', label: 'SIZE', options: SPX_SIZES, def: 2 },
     ];
-    alloc(N) { return { eR: new Float32Array(512), eI: new Float32Array(512), lw: new Float32Array(512), pw: new Float32Array(N / 2 + 1) }; }
+    alloc(N) {
+      // cepstrum length scales with N (128..512) so cost per second stays flat across SIZE
+      const Nc = clamp(N / 4, 128, 512);
+      return {
+        eR: new Float32Array(Nc), eI: new Float32Array(Nc), lw: new Float32Array(Nc), ge: new Float32Array(Nc / 2 + 1),
+        pw: new Float32Array(N / 2 + 1), t: { fft: new FFT(Nc), Nc },
+      };
+    }
+    onClear() { this.cLc = -1; }
     block(p) {
       const sp = p.spread / 2;
       this.r0 = Math.pow(2, (p.shift - sp) / 12); this.r1 = Math.pow(2, (p.shift + sp) / 12);
-      const Lc = Math.round(6 + 54 * (p.detail / 100));
+      const Nc = this.st.t.Nc, Lc = Math.max(3, Math.round((6 + 54 * (p.detail / 100)) * Nc / 512));
       if (Lc !== this.cLc) {
         this.cLc = Lc;
-        const lw = this.st.lw, t0 = Lc * 0.7;
-        for (let q = 0; q < 512; q++) {
-          const qq = q <= 256 ? q : 512 - q;
+        const lw = this.st.lw, t0 = Lc * 0.7, h = Nc / 2;
+        for (let q = 0; q < Nc; q++) {
+          const qq = q <= h ? q : Nc - q;
           lw[q] = qq <= t0 ? 1 : qq >= Lc ? 0 : 0.5 + 0.5 * Math.cos(Math.PI * (qq - t0) / (Lc - t0));
         }
       }
     }
-    onClear() { this.cLc = -1; }
     frame(re, im, ch) {
-      const st = this.st, B = this.B, pw = st.pw, eR = st.eR, eI = st.eI, lw = st.lw;
-      const q = this.N / 512, fl = 1e-12 * this.N * this.N;
+      const st = this.st, B = this.B, pw = st.pw, eR = st.eR, eI = st.eI, lw = st.lw, ge = st.ge, Nc = st.t.Nc, M = Nc / 2;
+      const q = (B - 1) / M, fl = 1e-12 * this.N * this.N;
       let ein = 0;
       for (let k = 0; k < B; k++) { const v = re[k] * re[k] + im[k] * im[k]; pw[k] = v; ein += v; }
-      for (let m = 0; m <= 256; m++) {
+      // max-pooled log magnitude envelope (M+1 points), even-extended
+      for (let m = 0; m <= M; m++) {
         let k0 = Math.round(m * q - q * 0.5), k1 = Math.round(m * q + q * 0.5) - 1;
         if (k0 < 0) k0 = 0; if (k1 >= B) k1 = B - 1; if (k1 < k0) k1 = k0;
         let mx = 0; for (let k = k0; k <= k1; k++) if (pw[k] > mx) mx = pw[k];
         const e = 0.5 * Math.log(mx + fl);
-        eR[m] = e; if (m > 0 && m < 256) eR[512 - m] = e;
+        eR[m] = e; if (m > 0 && m < M) eR[Nc - m] = e;
       }
       eI.fill(0);
-      SPX_F512.forward(eR, eI);
-      for (let i = 0; i < 512; i++) { eR[i] *= lw[i]; eI[i] *= lw[i]; }
-      SPX_F512.inverse(eR, eI);
-      const ir = 1 / (ch === 0 ? this.r0 : this.r1), iq = 1 / q;
+      st.t.fft.forward(eR, eI);
+      for (let i = 0; i < Nc; i++) { eR[i] *= lw[i]; eI[i] *= lw[i]; }
+      st.t.fft.inverse(eR, eI);
+      // gain at envelope resolution: exp(E(x / r) - E(x))
+      const ir = 1 / (ch === 0 ? this.r0 : this.r1);
+      for (let m = 0; m <= M; m++) {
+        const xs = Math.min(M, m * ir), i1 = xs | 0, f1 = xs - i1, e1 = i1 < M ? eR[i1] + (eR[i1 + 1] - eR[i1]) * f1 : eR[M];
+        let d = e1 - eR[m]; d = d < -3.4 ? -3.4 : d > 2.8 ? 2.8 : d;
+        ge[m] = Math.exp(d);
+      }
+      const iq = 1 / q;
       for (let k = 0; k < B; k++) {
-        const x = k * iq, xs = Math.min(256, x * ir);
-        const i0 = x | 0, f0 = x - i0, e0 = i0 < 256 ? eR[i0] + (eR[i0 + 1] - eR[i0]) * f0 : eR[256];
-        const i1 = xs | 0, f1 = xs - i1, e1 = i1 < 256 ? eR[i1] + (eR[i1 + 1] - eR[i1]) * f1 : eR[256];
-        let d = e1 - e0; d = d < -3.4 ? -3.4 : d > 2.8 ? 2.8 : d;
-        const g = Math.exp(d);
+        const x = k * iq, i0 = x | 0, g = i0 < M ? ge[i0] + (ge[i0 + 1] - ge[i0]) * (x - i0) : ge[M];
         re[k] *= g; im[k] *= g;
       }
       this.agc(re, im, ch, ein, 0.5, 2);
