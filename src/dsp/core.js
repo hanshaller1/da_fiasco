@@ -93,7 +93,7 @@ class DebacleEngine {
       case 'slots': this.setSlots(m.slots); break;
       case 'graph': this.graphs[m.i] = m.points.map((p) => ({ x: p.x, y: p.y, c: p.c || 0 })).sort((a, b) => a.x - b.x); break;
       case 'seq': this.seqs[m.which].pats = m.pats; break;
-      case 'source': this.src = { L: m.L, R: m.R || m.L, len: m.L.length }; this.srcPos = this.playing ? this.srcPos % this.src.len : 0; break;
+      case 'source': this.setSource(m.L, m.R || m.L); break;
       case 'srcmode': this.srcMode = m.mode; break;
       case 'srcgain': this.srcGain = m.g; break;
       case 'bpm': this.setBpm(m.bpm); break;
@@ -101,6 +101,16 @@ class DebacleEngine {
       case 'print': this.startPrint(m.len); break;
       case 'resetfx': { const s = this.fx[m.id]; if (s && s.inst) s.inst.reset(); break; }
     }
+  }
+  setSource(L, R) {
+    // loops that do not wrap smoothly get a 1.5 ms fade at the seam (length stays exact)
+    const len = L.length, jump = Math.abs(L[len - 1] - L[0]) + Math.abs(R[len - 1] - R[0]);
+    if (jump > 0.004 && len > 1024) {
+      const f = Math.max(16, Math.round(this.sr * 0.0015));
+      for (let i = 0; i < f; i++) { const g = i / f; L[i] *= g; L[len - 1 - i] *= g; if (R !== L) { R[i] *= g; R[len - 1 - i] *= g; } }
+    }
+    this.src = { L, R, len };
+    this.srcPos = this.playing ? this.srcPos % len : 0;
   }
   setBpm(b) { this.ctx.bpm = clamp(b, 30, 300); this.ctx.spb = this.sr * 60 / this.ctx.bpm; }
   setPlay(on) {
@@ -281,9 +291,6 @@ class DebacleEngine {
         const p = this.srcPos;
         this.seam[i] = p === 0 ? 1 : 0;
         l = src.L[p]; r = src.R[p];
-        // 3 ms crossfade at the loop seam
-        const fadeN = 144;
-        if (src.len > fadeN * 4 && p < fadeN) { const t = p / fadeN, q = src.len - fadeN + p; l = l * t + src.L[q] * (1 - t); r = r * t + src.R[q] * (1 - t); }
         this.srcPos = p + 1 >= src.len ? 0 : p + 1;
         l *= this.srcGain; r *= this.srcGain;
       }
@@ -419,38 +426,43 @@ class DebacleEngine {
       for (let c = 0; c < 2; c++) { this.eq[c][0].lowShelf(200, v.low, sr); this.eq[c][1].peak(1000, 0.7, v.mid, sr); this.eq[c][2].highShelf(5000, v.high, sr); }
     }
     const eqOn = Math.abs(v.low) > 0.05 || Math.abs(v.mid) > 0.05 || Math.abs(v.high) > 0.05;
-    this.gainS.set(dbToGain(v.gain)); this.panS.set(v.pan / 100); this.mixS.set(v.mix / 100); this.byS.set(v.bypass >= 0.5 ? 1 : 0);
+    const th = (clamp(v.pan / 100, -1, 1) + 1) * Math.PI / 4;
+    const gT = dbToGain(v.gain), glT = gT * Math.min(1, Math.cos(th) * Math.SQRT2), grT = gT * Math.min(1, Math.sin(th) * Math.SQRT2);
+    this.mixS.set(v.mix / 100); this.byS.set(v.bypass >= 0.5 ? 1 : 0);
     const comp = v.comp / 100, auto = v.auto / 100;
-    const thr = dbToGain(-6 - comp * 24), ratio = 1 + comp * 7, makeup = dbToGain(comp * 10);
+    const thr = dbToGain(-6 - comp * 24), ratio = 1 + comp * 7, makeup = dbToGain(comp * 10), expo = 1 / ratio - 1;
     const att = Math.exp(-1 / (0.005 * sr)), rel = Math.exp(-1 / (0.15 * sr));
-    const rmsC = 1 - Math.exp(-1 / (1.5 * sr));
     const dlat = Math.min(latency, this.mainDly[0].size - 8);
+    const sc = 1 - Math.exp(-1 / (0.03 * sr));
+    if (this.mgL === undefined) { this.mgL = glT; this.mgR = grT; }
+    let sumIn = 0, sumOut = 0;
+    const ag = this.autoG;
     for (let i = 0; i < n; i++) {
       let l = L[i], r = R[i];
       if (eqOn) { const e0 = this.eq[0], e1 = this.eq[1]; l = e0[2].process(e0[1].process(e0[0].process(l))); r = e1[2].process(e1[1].process(e1[0].process(r))); }
       if (comp > 0.001) {
         const pk = Math.max(Math.abs(l), Math.abs(r));
         this.compEnv = pk > this.compEnv ? pk + att * (this.compEnv - pk) : pk + rel * (this.compEnv - pk);
-        const g = (this.compEnv > thr ? Math.pow(this.compEnv / thr, 1 / ratio - 1) : 1) * makeup;
+        const g = (this.compEnv > thr ? Math.pow(this.compEnv / thr, expo) : 1) * makeup;
         l *= g; r *= g;
       }
-      const g = this.gainS.next();
-      const pan = this.panS.next(), th = (pan + 1) * Math.PI / 4;
-      l *= g * Math.min(1, Math.cos(th) * Math.SQRT2); r *= g * Math.min(1, Math.sin(th) * Math.SQRT2);
+      this.mgL += (glT - this.mgL) * sc; this.mgR += (grT - this.mgR) * sc;
+      l *= this.mgL; r *= this.mgR;
       // dry (original source) for master MIX, latency compensated
       this.mainDly[0].write(this.dL[i]); this.mainDly[1].write(this.dR[i]);
       const dl = dlat ? this.mainDly[0].tap(dlat) : this.dL[i], dr = dlat ? this.mainDly[1].tap(dlat) : this.dR[i];
-      // auto-gain: match long-term loudness of wet to the dry input
-      if (auto > 0.001) {
-        this.rmsIn += (dl * dl + dr * dr - this.rmsIn) * rmsC; this.rmsOut += (l * l + r * r - this.rmsOut) * rmsC;
-        const want = clamp(Math.sqrt((this.rmsIn + 1e-7) / (this.rmsOut + 1e-7)), 0.125, 8);
-        this.autoG += (Math.pow(want, auto) - this.autoG) * 0.0005;
-        l *= this.autoG; r *= this.autoG;
-      }
+      if (auto > 0.001) { sumIn += dl * dl + dr * dr; sumOut += l * l + r * r; l *= ag; r *= ag; }
       const m = this.mixS.next();
       l = dl + (l - dl) * m; r = dr + (r - dr) * m;
       const by = this.byS.next();
       L[i] = l + (this.dL[i] - l) * by; R[i] = r + (this.dR[i] - r) * by;
+    }
+    // auto-gain: match long-term loudness of the wet signal to the dry input (block rate)
+    if (auto > 0.001) {
+      const c = 1 - Math.exp(-n / (1.5 * sr));
+      this.rmsIn += (sumIn / n - this.rmsIn) * c; this.rmsOut += (sumOut / n - this.rmsOut) * c;
+      const want = clamp(Math.sqrt((this.rmsIn + 1e-7) / (this.rmsOut + 1e-7)), 0.125, 8);
+      this.autoG += (Math.pow(want, auto) - this.autoG) * (1 - Math.exp(-n / (0.4 * sr)));
     }
   }
 

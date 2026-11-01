@@ -177,7 +177,7 @@ class Stutter {
   _startRep(p, live) {
     // move current voice to fading slot, start a new voice for rep k
     const va = this.va, vb = this.vb;
-    vb.pos = va.pos; vb.rate = va.rate; vb.gain = va.gain; vb.panL = va.panL; vb.panR = va.panR; vb.live = va.live; vb.on = va.on;
+    vb.pos = va.pos; vb.rate = va.rate; vb.gain = va.gain * (va.env === undefined ? 1 : va.env); vb.panL = va.panL; vb.panR = va.panR; vb.live = va.live; vb.on = va.on;
     this.xf = 0;
     const k = this.k;
     let semis = p.pitch + p.ramp * k; semis = clamp(semis, -36, 36);
@@ -211,7 +211,8 @@ class Stutter {
     this.active = true;
     this._startRep(p, this.k === 0);
     if (this.k > 0) { this.va.pos += this.va.rate * rem; }
-    this.xf = 1; // no crossfade inside the engine for the first voice: act envelope handles dry→wet
+    // coming from dry, the act envelope fades in; from an active cycle, crossfade the voices
+    if (this.act <= 0 || !this.vb.on) this.xf = 1;
   }
   _gateEnv(u, g, curve) {
     if (g <= 0.001) return 1;
@@ -294,7 +295,8 @@ class Stutter {
       let wl = dl, wr = dr;
       if (va.on) {
         this._readVoice(va, tmp);
-        const env = this.active ? this._gateEnv(this.t / this.repLen, gate, gcurve) : 1;
+        const env = this.active ? this._gateEnv(this.t / this.repLen, gate, gcurve) : (va.env === undefined ? 1 : va.env);
+        va.env = env;
         let g = va.gain * env;
         wl = tmp[0] * g * va.panL; wr = tmp[1] * g * va.panR;
         if (this.xf < 1) {
@@ -350,6 +352,7 @@ class Stutter {
     const slewMs = zw === 4 ? 60 : zw === 5 ? 3 : 12;
     const slewC = 1 - Math.exp(-1 / (slewMs * 0.001 * sr));
     const xfN = Math.max(32, 0.006 * sr);
+    const gateC = 1 - Math.exp(-1 / (0.0012 * sr));
     this.xfStep = 1 / xfN;
     for (let i = 0; i < n; i++) {
       const dl = L[i], dr = R[i];
@@ -386,7 +389,8 @@ class Stutter {
         const rr = this._scratchRate(b.scratch, ph, b.depth);
         b.rate += (rr - b.rate) * slewC;
         va.rate = b.rate;
-        b.gate = b.scratch === 1 ? ((Math.floor(ph * 8) & 1) ? 0.05 : 1) : 1;
+        const gt = b.scratch === 1 ? ((Math.floor(ph * 8) & 1) ? 0.05 : 1) : 1;
+        b.gate += (gt - b.gate) * gateC; // ~1 ms smoothing on the transformer chop
       } else if (si !== b.sub) {
         b.sub = si;
         // choose source sub-section
@@ -458,7 +462,7 @@ class Stutter {
   }
   _swapVoice() {
     const va = this.va, vb = this.vb;
-    vb.pos = va.pos; vb.rate = va.rate; vb.gain = va.gain * (this.b.drop ? 0 : 1); vb.on = va.on; this.xf = 0;
+    vb.pos = va.pos; vb.rate = va.rate; vb.gain = va.gain * (this.b.drop ? 0 : 1) * this.b.gate; vb.on = va.on; this.xf = 0;
   }
   _wrapLoop(pos, start, T) {
     let x = pos - start;
