@@ -121,7 +121,32 @@
       y = MOT_HB1 * (a + s[23]) - s[21]; s[21] = s[20]; s[20] = a; s[23] = s[22]; s[22] = y; a = y;
       y = MOT_HB2 * (a + s[27]) - s[25]; s[25] = s[24]; s[24] = a; s[27] = s[26]; s[26] = y; a = y;
       y = MOT_HB3 * (a + s[31]) - s[29]; s[29] = s[28]; s[28] = a; s[31] = s[30]; s[30] = y;
-      this.im = y;
+      this.im = -y; // sign chosen so that re*cos - im*sin shifts UP for positive frequencies
+    }
+  }
+
+  // Per-block parameter smoother: every numeric param glides with a one-pole (~20 ms at block
+  // rate) before the effect sees it; enums, toggles and tempo divisions pass through untouched.
+  // Gains that act directly on the signal are additionally ramped per sample inside the kernels.
+  class MOT_PSm {
+    constructor(params, ms) {
+      this.all = []; this.num = [];
+      for (const d of params) { this.all.push(d.id); if (!d.options && !d.toggle && !d.div) this.num.push(d.id); }
+      this.s = new Float64Array(this.num.length); this.v = {}; this.first = true; this.ms = ms || 20;
+      for (const id of this.all) this.v[id] = 0;
+    }
+    step(p, n, sr) {
+      const v = this.v, s = this.s, num = this.num, all = this.all;
+      const c = this.first ? 1 : 1 - Math.exp(-n / (this.ms * 0.001 * sr));
+      for (let j = 0; j < all.length; j++) v[all[j]] = p[all[j]];
+      for (let j = 0; j < num.length; j++) {
+        const t = p[num[j]];
+        let x = s[j] + (t - s[j]) * c;
+        if (Math.abs(t - x) <= 1e-7 * (1 + Math.abs(t))) x = t;
+        s[j] = x; v[num[j]] = x;
+      }
+      this.first = false;
+      return v;
     }
   }
 
@@ -156,53 +181,72 @@
       { id: 'highf', label: 'HIGH FREQ', min: 1000, max: 16000, def: 5000, unit: 'Hz', curve: 'exp' },
     ];
     init() {
-      this.f = [[], []];
-      for (let c = 0; c < 2; c++) for (let j = 0; j < 7; j++) this.f[c].push(new MOT_SVF());
+      const sr = this.sr;
+      this.co = new Float64Array(7 * 6);                       // stage coefs a1 a2 a3 m0 m1 m2 (shared L/R)
+      this.st = [new Float64Array(16), new Float64Array(16)];  // per channel: 7 x (ic1, ic2), cut-filter mixes
       this.cur = new Float64Array(10); this.tg = new Float64Array(10);
-      this.first = true; this.lc = false; this.hc = false;
+      this.tmp = new MOT_SVF(); this.first = true;
+      this.c16 = 1 - Math.exp(-16 / (0.02 * sr)); this.cmx = 1 - Math.exp(-1 / (0.005 * sr));
+    }
+    _coefs() {
+      const sr = this.sr, cur = this.cur, co = this.co, f = this.tmp;
+      const lcf = Math.exp(cur[3]), hcf = Math.exp(cur[4]);
+      for (let j = 0; j < 7; j++) {
+        if (j === 0) MOT_eqSet(f, 0, Math.exp(cur[6]), cur[0], 0.71, sr);
+        else if (j === 1) MOT_eqSet(f, 1, Math.exp(cur[7]), cur[1], Math.exp(cur[8]), sr);
+        else if (j === 2) MOT_eqSet(f, 2, Math.exp(cur[9]), cur[2], 0.71, sr);
+        else if (j < 5) MOT_eqSet(f, 3, lcf, 0, j === 3 ? 0.5412 : 1.3066, sr);
+        else MOT_eqSet(f, 4, hcf, 0, j === 5 ? 0.5412 : 1.3066, sr);
+        const o = j * 6; co[o] = f.a1; co[o + 1] = f.a2; co[o + 2] = f.a3; co[o + 3] = f.m0; co[o + 4] = f.m1; co[o + 5] = f.m2;
+      }
     }
     process(L, R, n, p) {
-      const sr = this.sr, cur = this.cur, tg = this.tg;
+      // EQ smooths its own params (log domain for frequencies) and updates coefficients every 16 samples
+      const cur = this.cur, tg = this.tg, c16 = this.c16;
       tg[0] = p.low; tg[1] = p.mid; tg[2] = p.high; tg[3] = Math.log(p.lowcut); tg[4] = Math.log(p.hicut);
       tg[5] = p.drive * 0.01; tg[6] = Math.log(p.lowf); tg[7] = Math.log(p.midf); tg[8] = Math.log(p.midq); tg[9] = Math.log(p.highf);
-      let changed = false;
-      if (this.first) { cur.set(tg); changed = true; this.first = false; }
-      else {
+      if (this.first) { cur.set(tg); this._coefs(); this.first = false; }
+      for (let off = 0; off < n; off += 16) {
+        const e = Math.min(n, off + 16);
+        let changed = false;
         for (let j = 0; j < 10; j++) {
           const d = tg[j] - cur[j];
           if (d === 0) continue;
-          if (d < 1e-4 && d > -1e-4) cur[j] = tg[j]; else cur[j] += d * 0.3;
-          changed = true;
+          cur[j] = Math.abs(d) < 1e-5 ? tg[j] : cur[j] + d * c16; changed = true;
         }
+        if (changed) this._coefs();
+        const d = cur[5], dm = Math.min(1, d * 3), dg = 1 + 19 * d * d, dn = 0.5 / MOT_tanh(0.5 * dg);
+        const lcT = cur[3] > 3.0204 ? 1 : 0, hcT = cur[4] < 9.8782 ? 1 : 0; // ln(20.5 Hz), ln(19.5 kHz)
+        this._k(L, this.st[0], off, e, dm, dg, dn, lcT, hcT);
+        this._k(R, this.st[1], off, e, dm, dg, dn, lcT, hcT);
       }
-      if (changed) {
-        const lcf = Math.exp(cur[3]), hcf = Math.exp(cur[4]);
-        const lc = lcf > 20.5, hc = hcf < 19500;
-        for (let c = 0; c < 2; c++) {
-          const f = this.f[c];
-          MOT_eqSet(f[0], 0, Math.exp(cur[6]), cur[0], 0.71, sr);
-          MOT_eqSet(f[1], 1, Math.exp(cur[7]), cur[1], Math.exp(cur[8]), sr);
-          MOT_eqSet(f[2], 2, Math.exp(cur[9]), cur[2], 0.71, sr);
-          if (lc && !this.lc) { f[3].reset(); f[4].reset(); }
-          if (hc && !this.hc) { f[5].reset(); f[6].reset(); }
-          MOT_eqSet(f[3], 3, lcf, 0, 0.5412, sr); MOT_eqSet(f[4], 3, lcf, 0, 1.3066, sr);
-          MOT_eqSet(f[5], 4, hcf, 0, 0.5412, sr); MOT_eqSet(f[6], 4, hcf, 0, 1.3066, sr);
+    }
+    // shelf -> bell -> shelf -> drive -> 24 dB low cut -> 24 dB high cut (cuts cross-faded in/out)
+    _k(buf, st, i0, i1, dm, dg, dn, lcT, hcT) {
+      const co = this.co, cmx = this.cmx;
+      let ml = st[14], mh = st[15];
+      for (let i = i0; i < i1; i++) {
+        let x = buf[i];
+        for (let j = 0; j < 3; j++) {
+          const o = j * 6, s = j * 2, ic1 = st[s], ic2 = st[s + 1];
+          const v3 = x - ic2, v1 = co[o] * ic1 + co[o + 1] * v3, v2 = ic2 + co[o + 1] * ic1 + co[o + 2] * v3;
+          st[s] = 2 * v1 - ic1; st[s + 1] = 2 * v2 - ic2;
+          x = co[o + 3] * x + co[o + 4] * v1 + co[o + 5] * v2;
         }
-        this.lc = lc; this.hc = hc;
-      }
-      const d = cur[5], dm = d * 3 > 1 ? 1 : d * 3, dg = 1 + 19 * d * d, dn = 0.5 / MOT_tanh(0.5 * dg);
-      const lc = this.lc, hc = this.hc;
-      for (let c = 0; c < 2; c++) {
-        const buf = c ? R : L, f = this.f[c];
-        const f0 = f[0], f1 = f[1], f2 = f[2], f3 = f[3], f4 = f[4], f5 = f[5], f6 = f[6];
-        for (let i = 0; i < n; i++) {
-          let x = f2.run(f1.run(f0.run(buf[i])));
-          if (d > 0) x += (MOT_tanh(x * dg) * dn - x) * dm;
-          if (lc) x = f4.run(f3.run(x));
-          if (hc) x = f6.run(f5.run(x));
-          buf[i] = x;
+        x += (MOT_tanh(x * dg) * dn - x) * dm;
+        let y = x;
+        for (let j = 3; j < 7; j++) {
+          const o = j * 6, s = j * 2, ic1 = st[s], ic2 = st[s + 1];
+          const v3 = y - ic2, v1 = co[o] * ic1 + co[o + 1] * v3, v2 = ic2 + co[o + 1] * ic1 + co[o + 2] * v3;
+          st[s] = 2 * v1 - ic1; st[s + 1] = 2 * v2 - ic2;
+          const out = co[o + 3] * y + co[o + 4] * v1 + co[o + 5] * v2;
+          if (j === 4) { ml += (lcT - ml) * cmx; y = x + (out - x) * ml; x = y; }
+          else if (j === 6) { mh += (hcT - mh) * cmx; y = x + (out - x) * mh; }
+          else y = out;
         }
+        buf[i] = y;
       }
+      st[14] = ml; st[15] = mh;
     }
   });
 
@@ -224,7 +268,7 @@
     static latency = 0;
     static params = [
       { id: 'cutoff', label: 'CUTOFF', min: 20, max: 20000, def: 650, unit: 'Hz', curve: 'exp' },
-      { id: 'res', label: 'RES', min: 0, max: 100, def: 55, unit: '%' },
+      { id: 'res', label: 'RES', min: 0, max: 100, def: 60, unit: '%' },
       { id: 'type', label: 'TYPE', options: ['SVF', 'LADDER', 'DIODE', 'BROKEN'], def: 1 },
       { id: 'mode', label: 'MODE', options: ['LP', 'BP', 'HP', 'NOTCH'], def: 0 },
       { id: 'drive', label: 'DRIVE', min: 0, max: 100, def: 30, unit: '%' },
@@ -235,24 +279,28 @@
       { id: 'snap', label: 'SNAP', toggle: true, def: 0 },
     ];
     init() {
+      this.ps = new MOT_PSm(this.constructor.params);
       const sr = this.sr;
       this.s = [new Float64Array(6), new Float64Array(6)];
-      // misc state: 0 smoothed ln(cutoff), 1..2 env L/R, 3..8 cached ladder G1/G2/G4 per channel, 9..10 cached SVF g
-      this.S = new Float64Array(12); this.K = new Float64Array(24);
+      // misc state: 0 smoothed ln(cutoff), 1..2 env L/R, 3..8 cached ladder G1/G2/G4 per channel, 9..10 cached SVF g,
+      // 11 input gain, 12 output gain (both ramped per sample)
+      this.S = new Float64Array(16); this.K = new Float64Array(24); this.S[11] = -1;
       this.lsc = 1 - Math.exp(-1 / (0.025 * sr)); this.ea = Math.exp(-1 / (0.002 * sr)); this.er = Math.exp(-1 / (0.15 * sr));
       this.first = true;
       this.dv = new Float64Array(2); this.dt = new Float64Array(2); this.dtm = new Int32Array(2);
       this.kj = new Float64Array(2); this.pop = new Float64Array(2);
       this.rng = new Rng(0x51f15e); this.snp = new MOT_Snap();
       const gh = Math.tan(Math.PI * 110 / sr); this.hpG = gh / (1 + gh);
-      this.lastType = -1;
+      this.lastType = -1; this.lastTypeG = -1;
     }
     process(L, R, n, p, ctx) {
+      p = this.ps.step(p, n, this.sr);
       const type = p.type | 0, mode = p.mode | 0, slope = p.slope | 0, S = this.S, K = this.K;
       if (type !== this.lastType) { this.s[0].fill(0); this.s[1].fill(0); this.lastType = type; }
       const res = p.res * 0.01, drv = p.drive * 0.01, drift = p.drift * 0.01;
       let fc = p.cutoff; if (p.snap) fc = this.snp.hz(ctx.key, fc);
       if (this.first) { S[0] = Math.log(fc); this.first = false; }
+      const typeChanged = type !== this.lastTypeG; this.lastTypeG = type;
       const rng = this.rng, broken = type === 3;
       for (let c = 0; c < 2; c++) {
         if (--this.dtm[c] <= 0) { this.dt[c] = rng.bi(); this.dtm[c] = 40 + rng.int(160); }
@@ -265,22 +313,25 @@
       K[0] = Math.log(fc); K[1] = this.dv[0] * dS; K[2] = this.dv[1] * dS; K[3] = dr; K[4] = 1 / Math.pow(dr, 0.55);
       K[5] = envA; K[6] = fm; K[7] = envA !== 0 || broken ? 1 : 0; K[8] = mode; K[9] = slope;
       if (type === 0) {
-        const kB = 1.414 * Math.pow(1 - res, 1.3) - 0.03 * Math.pow(res, 8);
+        const kB = 1.414 * Math.pow(1 - res, 1.3) - 0.1 * Math.pow(res, 8);
         K[10] = kB; K[11] = 1.5 * Math.max(kB, 0.03);
         K[12] = slope === 3 || ((mode === 1 || mode === 3) && slope === 2) ? 1 : 0;
         K[13] = slope === 2 && (mode === 0 || mode === 2) ? 1 : 0;
+        if (S[11] < 0 || typeChanged) { S[11] = dr; S[12] = K[4]; }
         this._svf(L, R, n);
         return;
       }
-      const diode = type === 2, k0 = diode ? res * 5.2 : res * 4.15;
+      // self-oscillation: ladder above ~95 % RES; diode threshold rises at low cutoff (HP in the feedback path)
+      const rr = res * Math.sqrt(res), diode = type === 2, k0 = diode ? 6.2 * rr : 4.5 * rr;
       let cm = 1;
-      if (mode === 0) cm = diode ? 1 + 0.15 * k0 : 1 + 0.7 * k0;
+      if (mode === 0) cm = diode ? 1 + 0.45 * k0 : 1 + 0.7 * k0;
       else if (mode === 3) cm = diode ? 1 + 0.1 * k0 : 1 + 0.35 * k0;
       const xo = (mode * 4 + slope) * 5;
       for (let j = 0; j < 5; j++) K[10 + j] = MOT_XP[xo + j];
       K[15] = type; K[16] = k0; K[17] = cm; K[18] = broken ? 1.6 * MOT_LN2 * (0.3 + drv) : 0; K[19] = 0.08 * drv + 0.02;
       K[20] = broken ? k0 * (1 + 0.22 * this.kj[0]) : k0; K[21] = broken ? k0 * (1 + 0.22 * this.kj[1]) : k0;
       K[22] = broken ? this.pop[0] : 0; K[23] = broken ? this.pop[1] : 0;
+      if (S[11] < 0 || typeChanged) { S[11] = dr * cm; S[12] = K[4]; }
       this._lad(L, R, n);
     }
     // SVF core: optional pre-stage (Q .54) + resonant stage with a saturating band state
@@ -289,9 +340,10 @@
       const lt = K[0], d0 = K[1], d1 = K[2], dr = K[3], og = K[4], envA = K[5], fm = K[6], useEnv = K[7], mode = K[8], slope = K[9];
       const kB = K[10], bpn = K[11], two = K[12], op = K[13], kA = 1.848, lsc = this.lsc, ea = this.ea, er = this.er;
       const ar = useEnv || fm !== 0;
-      let lf0 = S[0], eL = S[1], eR = S[2], gL = S[9], gR = S[10];
+      let lf0 = S[0], eL = S[1], eR = S[2], gL = S[9], gR = S[10], gi = S[11], go = S[12];
+      const giI = (dr - gi) / n, goI = (og - go) / n;
       for (let i = 0; i < n; i++) {
-        lf0 += (lt - lf0) * lsc;
+        lf0 += (lt - lf0) * lsc; gi += giI; go += goI;
         const upd = ar || (i & 3) === 0;
         for (let c = 0; c < 2; c++) {
           const buf = c ? R : L, s = c ? sR : sL, x = buf[i];
@@ -302,7 +354,7 @@
             g = MOT_g(Math.exp(lf0 + (c ? d1 : d0) + envA * (c ? eR : eL) * useEnv + fm * x), sr);
             if (c) gR = g; else gL = g;
           }
-          let v = MOT_tanh(x * dr * 0.8) * 1.25;
+          let v = MOT_tanh(x * gi * 0.8) * 1.25;
           if (two) {
             const a1 = 1 / (1 + g * (g + kA)), a2 = g * a1, a3 = g * a2;
             const v3 = v - s[1], v1 = a1 * s[0] + a2 * v3, v2 = s[1] + a2 * s[0] + a3 * v3;
@@ -318,10 +370,10 @@
           else if (mode === 1) y = v1 * bpn;
           else y = v - kB * v1;
           if (op) { const G = g / (1 + g), w = (y - s[4]) * G, lp = w + s[4]; s[4] = lp + w; y = mode === 0 ? lp : y - lp; }
-          buf[i] = y * og;
+          buf[i] = y * go;
         }
       }
-      S[0] = lf0; S[1] = eL; S[2] = eR; S[9] = gL; S[10] = gR;
+      S[0] = lf0; S[1] = eL; S[2] = eR; S[9] = gL; S[10] = gR; S[11] = gi; S[12] = go;
     }
     // ladder cores: linear ZDF solve of the 4-pole loop + input nonlinearity, Xpander tap mixing
     _lad(L, R, n) {
@@ -331,9 +383,10 @@
       const kL = K[20], kR = K[21], pL = K[22], pR = K[23], lsc = this.lsc, ea = this.ea, er = this.er;
       const diode = type === 2, broken = type === 3, Gh = this.hpG, Bh = diode ? 1 - Gh : 1;
       const ar = useEnv || fm !== 0;
-      let lf0 = S[0], eL = S[1], eR = S[2];
+      let lf0 = S[0], eL = S[1], eR = S[2], gi = S[11], go = S[12];
+      const giI = (dr * cm - gi) / n, goI = (og - go) / n;
       for (let i = 0; i < n; i++) {
-        lf0 += (lt - lf0) * lsc;
+        lf0 += (lt - lf0) * lsc; gi += giI; go += goI;
         const upd = ar || (i & 3) === 0;
         for (let c = 0; c < 2; c++) {
           const buf = c ? R : L, s = c ? sR : sL, x = buf[i], o = 3 + c * 3;
@@ -348,12 +401,12 @@
           const G1 = S[o], G2 = S[o + 1], G4 = S[o + 2], G3 = G2;
           const Sx = (1 - G4) * s[3] + G4 * ((1 - G3) * s[2] + G3 * ((1 - G2) * s[1] + G2 * (1 - G1) * s[0]));
           const GG = G1 * G2 * G3 * G4, k = c ? kR : kL;
-          const xin = x * dr * cm + (c ? pR * eR : pL * eL) * popA;
+          const xin = x * gi + (c ? pR * eR : pL * eL) * popA;
           const sh = diode ? s[4] : 0;
           const y4e = (GG * (xin + k * Bh * sh) + Sx) / (1 + k * GG * Bh);
           let u = xin - k * Bh * (y4e - sh);
-          if (type === 1) u = MOT_tanh(u);
-          else if (diode) u = MOT_tanh(u + 0.3) - 0.2913;
+          if (type === 1) u = 1.6 * MOT_tanh(u * 0.625);                   // ladder: symmetric, 1.6 headroom
+          else if (diode) u = 1.6 * (MOT_tanh(u * 0.625 + 0.2) - 0.1974); // diode: biased (even harmonics)
           else { const a = Math.abs(u); u = u * (a + 0.012) / (a + 0.05); u = MOT_tanh(u > 0 ? u * 1.25 : u * 0.8); }
           let w = (u - s[0]) * G1; const y1 = w + s[0]; s[0] = y1 + w;
           w = (y1 - s[1]) * G2; const y2 = w + s[1]; s[1] = y2 + w;
@@ -361,10 +414,10 @@
           if (broken) s[2] = Math.max(-0.45, Math.min(0.6, s[2]));
           w = (y3 - s[3]) * G4; const y4 = w + s[3]; s[3] = y4 + w;
           if (diode) s[4] += 2 * (y4 - s[4]) * Gh;
-          buf[i] = (t0 * u + t1 * y1 + t2 * y2 + t3 * y3 + t4 * y4) * og;
+          buf[i] = (t0 * u + t1 * y1 + t2 * y2 + t3 * y3 + t4 * y4) * go;
         }
       }
-      S[0] = lf0; S[1] = eL; S[2] = eR;
+      S[0] = lf0; S[1] = eL; S[2] = eR; S[11] = gi; S[12] = go;
     }
   });
 
@@ -388,10 +441,11 @@
       { id: 'snap', label: 'SNAP', toggle: true, def: 0 },
     ];
     init() {
+      this.ps = new MOT_PSm(this.constructor.params);
       const sr = this.sr, maxD = Math.ceil(sr / 7) + 8, sz = MOT_pow2(maxD + 8);
       this.rb = []; for (let j = 0; j < 6; j++) this.rb.push(new Float32Array(sz));
       this.rm = sz - 1; this.rw = 0; this.maxD = maxD - 8;
-      this.st = new Float64Array(10);  // tone ic1/ic2 L, R; loop low-pass x6
+      this.st = new Float64Array(16);  // tone LP ic1/ic2 L,R (0..3); loop low-pass x6 (4..9); tone HP L,R (10..13); fb, og (14, 15)
       this.dv = new Float64Array(3); this.dt = new Float64Array(3);
       this.sc = 1 - Math.exp(-1 / (0.025 * sr));
       this.tone = new MOT_SVF();
@@ -400,9 +454,10 @@
       this.ef = 0; this.es = 0; this.rs = 0x2545f491;
       this.bAmp = 0; this.bDec = Math.exp(-1 / (0.007 * sr)); this.refr = 0;
       this.snp = [new MOT_Snap(), new MOT_Snap(), new MOT_Snap()];
-      this.first = true; this.toneV = 0; this.K = new Float64Array(12);
+      this.first = true; this.toneV = 0; this.K = new Float64Array(16); this.lpT = new MOT_SVF(); this.hpT = new MOT_SVF();
     }
     process(L, R, n, p, ctx) {
+      p = this.ps.step(p, n, this.sr);
       const sr = this.sr, fb = p.fb * 0.01, neg = fb < 0, afb = neg ? -fb : fb;
       const damp = p.damp * 0.01;
       const fd = 18000 * Math.pow(600 / 18000, damp), cl = 1 - Math.exp(-2 * Math.PI * fd / sr), gd = (1 - cl) / cl;
@@ -410,8 +465,8 @@
       for (let j = 0; j < 3; j++) {
         let f = p.freq * semisToRatio(j === 0 ? 0 : j === 1 ? p.off1 : p.off2);
         if (p.snap) f = this.snp[j].hz(ctx.key, f);
-        // delay for y[n-D] read before the write; negative feedback halves it (odd harmonics at FREQ)
-        let D = sr / f * (neg ? 0.5 : 1) - gd - 1;
+        // delay for y[n-D] (read before the write). Negative feedback keeps D: odd harmonics, an octave lower
+        let D = sr / f - gd - 1;
         if (D < 3) D = 3; else if (D > this.maxD) D = this.maxD;
         dt[j] = D; if (this.first) dv[j] = D;
       }
@@ -419,24 +474,27 @@
       const tv = p.tone * 0.01;
       this.toneV += (tv - this.toneV) * (this.first ? 1 : 0.3);
       this.first = false;
-      const t = this.toneV, tf = this.tone;
-      if (t <= 0) tf.lp(MOT_g(18000 * Math.pow(2, t * 6.5), sr), 0.6); else tf.hp(MOT_g(20 * Math.pow(2, t * 7.6), sr), 0.6);
-      const ta1 = tf.a1, ta2 = tf.a2, ta3 = tf.a3, tm0 = tf.m0, tm1 = tf.m1, tm2 = tf.m2;
+      // tone tilt = LP (closes below centre) in series with HP (opens above centre): both always running
+      const t = this.toneV, lpT = this.lpT, hpT = this.hpT;
+      lpT.lp(MOT_g(18000 * Math.pow(2, Math.min(0, t) * 6.5), sr), 0.6); hpT.hp(MOT_g(20 * Math.pow(2, Math.max(0, t) * 7.6), sr), 0.6);
       const og = 0.5 * Math.sqrt((1 - afb * afb) / (1 + afb * afb)) + 0.02;
       const K = this.K;
-      K[0] = fb; K[1] = cl; K[2] = og; K[3] = p.pluck * 0.01; K[4] = ta1; K[5] = ta2; K[6] = ta3; K[7] = tm0; K[8] = tm1; K[9] = tm2;
+      K[0] = fb; K[1] = cl; K[2] = og; K[3] = p.pluck * 0.01; K[4] = lpT.a1; K[5] = lpT.a2; K[6] = lpT.a3; K[7] = hpT.a1; K[8] = hpT.a2; K[9] = hpT.a3; K[10] = hpT.k;
+      if (this.st[15] === 0) { this.st[14] = fb; this.st[15] = og; }
       this._k(L, R, n);
     }
     // per-sample kernel (compact, so the JIT tiers it up quickly)
     _k(L, R, n) {
       const K = this.K, sr = this.sr, dt = this.dt, dv = this.dv;
-      const fb = K[0], cl = K[1], og = K[2], pl = K[3], ta1 = K[4], ta2 = K[5], ta3 = K[6], tm0 = K[7], tm1 = K[8], tm2 = K[9];
+      const cl = K[1], pl = K[3], ta1 = K[4], ta2 = K[5], ta3 = K[6], ha1 = K[7], ha2 = K[8], ha3 = K[9], hk = K[10];
       const refrN = Math.round(0.06 * sr), bDec = this.bDec, sc = this.sc;
       const efa = this.efa, efr = this.efr, esa = this.esa, esr = this.esr;
       const b0 = this.rb[0], b1 = this.rb[1], b2 = this.rb[2], b3 = this.rb[3], b4 = this.rb[4], b5 = this.rb[5], m = this.rm;
       const st = this.st, t0 = dt[0], t1 = dt[1], t2 = dt[2];
       let w = this.rw, v0 = dv[0], v1 = dv[1], v2 = dv[2], ef = this.ef, es = this.es, rs = this.rs, bAmp = this.bAmp, refr = this.refr;
       let tl1 = st[0], tl2 = st[1], tr1 = st[2], tr2 = st[3], l0 = st[4], l1 = st[5], l2 = st[6], l3 = st[7], l4 = st[8], l5 = st[9];
+      let hl1 = st[10], hl2 = st[11], hr1 = st[12], hr2 = st[13], fb = st[14], og = st[15];
+      const fbI = (K[0] - fb) / n, ogI = (K[2] - og) / n;
       for (let i = 0; i < n; i++) {
         v0 += (t0 - v0) * sc; v1 += (t1 - v1) * sc; v2 += (t2 - v2) * sc;
         let xl = L[i], xr = R[i];
@@ -450,11 +508,16 @@
         rs ^= rs << 13; rs ^= rs >>> 17; rs ^= rs << 5;
         xl += ((rs & 0xffff) * 3.0517578125e-5 - 1) * bAmp; xr += ((rs >>> 16) * 3.0517578125e-5 - 1) * bAmp;
         bAmp *= bDec;
-        // tone filter (SVF, mixed output)
+        fb += fbI; og += ogI;
+        // tone: LP then HP (SVFs)
         let v3 = xl - tl2, q1 = ta1 * tl1 + ta2 * v3, q2 = tl2 + ta2 * tl1 + ta3 * v3;
-        tl1 = 2 * q1 - tl1; tl2 = 2 * q2 - tl2; const exl = tm0 * xl + tm1 * q1 + tm2 * q2;
+        tl1 = 2 * q1 - tl1; tl2 = 2 * q2 - tl2; let ex = q2;
+        v3 = ex - hl2; q1 = ha1 * hl1 + ha2 * v3; q2 = hl2 + ha2 * hl1 + ha3 * v3;
+        hl1 = 2 * q1 - hl1; hl2 = 2 * q2 - hl2; const exl = ex - hk * q1 - q2;
         v3 = xr - tr2; q1 = ta1 * tr1 + ta2 * v3; q2 = tr2 + ta2 * tr1 + ta3 * v3;
-        tr1 = 2 * q1 - tr1; tr2 = 2 * q2 - tr2; const exr = tm0 * xr + tm1 * q1 + tm2 * q2;
+        tr1 = 2 * q1 - tr1; tr2 = 2 * q2 - tr2; ex = q2;
+        v3 = ex - hr2; q1 = ha1 * hr1 + ha2 * v3; q2 = hr2 + ha2 * hr1 + ha3 * v3;
+        hr1 = 2 * q1 - hr1; hr2 = 2 * q2 - hr2; const exr = ex - hk * q1 - q2;
         // combs: y = ex + fb * tanh(lp(y[n-D]))
         let y, sl, sr2;
         l0 += cl * (MOT_rd(b0, m, w, v0) - l0); y = exl + fb * MOT_tanh(l0); b0[w] = y; sl = y;
@@ -467,6 +530,7 @@
         L[i] = sl * og; R[i] = sr2 * og;
       }
       st[0] = tl1; st[1] = tl2; st[2] = tr1; st[3] = tr2; st[4] = l0; st[5] = l1; st[6] = l2; st[7] = l3; st[8] = l4; st[9] = l5;
+      st[10] = hl1; st[11] = hl2; st[12] = hr1; st[13] = hr2; st[14] = fb; st[15] = og;
       dv[0] = v0; dv[1] = v1; dv[2] = v2; this.rw = w; this.ef = ef; this.es = es; this.rs = rs;
       this.bAmp = bAmp < 1e-6 ? 0 : bAmp; this.refr = refr < -1e6 ? -1 : refr;
     }
@@ -503,6 +567,7 @@
     }
     return out;
   }
+  const MOT_VOICE_GAIN = new Float64Array([1, 0.95, 1.12, 1.42, 0.55]); // level match across voices
   const MOT_VOICES = [
     MOT_mkVoice(MOT_VOW_M, 1, 1, 0.7, 0),
     MOT_mkVoice(MOT_VOW_F, 1, 1, 0.7, 0),
@@ -527,17 +592,19 @@
       { id: 'spread', label: 'SPREAD', min: 0, max: 100, def: 30, unit: '%' },
     ];
     init() {
+      this.ps = new MOT_PSm(this.constructor.params);
       this.st = [new Float64Array(10), new Float64Array(10)];
       this.cf = [new Float64Array(20), new Float64Array(20)];
       this.pv = 0; this.first = true;
     }
     process(L, R, n, p, ctx) {
+      p = this.ps.step(p, n, this.sr);
       const sr = this.sr, V = MOT_VOICES[p.voice | 0] || MOT_VOICES[0];
       const base = p.vowel * 0.04;
       const qs = Math.pow(2, (0.5 - p.q * 0.01) * 3.2);
       const shL = p.shift / 12 * MOT_LN2, sp = p.spread * 0.01;
       const gc = 1 - Math.exp(-16 / (Math.max(1, p.glide) * 0.001 * sr));
-      const mk = 2.6;
+      const mk = 5.8 * (MOT_VOICE_GAIN[p.voice | 0] || 1); // make-up: five narrow bands keep only a fraction of broadband energy
       for (let off = 0; off < n; off += 16) {
         const m = n - off < 16 ? n - off : 16;
         let tgt = base;
@@ -563,20 +630,26 @@
             cf[o] = a1; cf[o + 1] = g * a1; cf[o + 2] = g * g * a1; cf[o + 3] = amp * k * mk;
           }
         }
-        for (let c = 0; c < 2; c++) {
-          const buf = c ? R : L, cf = this.cf[c], st = this.st[c], e = off + m;
-          for (let i = off; i < e; i++) {
-            const x = buf[i]; let y = 0;
-            for (let j = 0; j < 5; j++) {
-              const o = j * 4, s = j * 2, ic1 = st[s], ic2 = st[s + 1];
-              const v3 = x - ic2, v1 = cf[o] * ic1 + cf[o + 1] * v3, v2 = ic2 + cf[o + 1] * ic1 + cf[o + 2] * v3;
-              st[s] = 2 * v1 - ic1; st[s + 1] = 2 * v2 - ic2;
-              y += cf[o + 3] * v1;
-            }
-            buf[i] = y;
-          }
-        }
+        this._k(L, this.cf[0], this.st[0], off, off + m);
+        this._k(R, this.cf[1], this.st[1], off, off + m);
       }
+    }
+    // five parallel band-passes (SVF), formant amplitudes folded into cf[j*4+3]
+    _k(buf, cf, st, i0, i1) {
+      const a0 = cf[0], b0 = cf[1], c0 = cf[2], g0 = cf[3], a1 = cf[4], b1 = cf[5], c1 = cf[6], g1 = cf[7];
+      const a2 = cf[8], b2 = cf[9], c2 = cf[10], g2 = cf[11], a3 = cf[12], b3 = cf[13], c3 = cf[14], g3 = cf[15];
+      const a4 = cf[16], b4 = cf[17], c4 = cf[18], g4 = cf[19];
+      let p0 = st[0], q0 = st[1], p1 = st[2], q1 = st[3], p2 = st[4], q2 = st[5], p3 = st[6], q3 = st[7], p4 = st[8], q4 = st[9];
+      for (let i = i0; i < i1; i++) {
+        const x = buf[i];
+        let v3 = x - q0, v1 = a0 * p0 + b0 * v3, v2 = q0 + b0 * p0 + c0 * v3; p0 = 2 * v1 - p0; q0 = 2 * v2 - q0; let y = g0 * v1;
+        v3 = x - q1; v1 = a1 * p1 + b1 * v3; v2 = q1 + b1 * p1 + c1 * v3; p1 = 2 * v1 - p1; q1 = 2 * v2 - q1; y += g1 * v1;
+        v3 = x - q2; v1 = a2 * p2 + b2 * v3; v2 = q2 + b2 * p2 + c2 * v3; p2 = 2 * v1 - p2; q2 = 2 * v2 - q2; y += g2 * v1;
+        v3 = x - q3; v1 = a3 * p3 + b3 * v3; v2 = q3 + b3 * p3 + c3 * v3; p3 = 2 * v1 - p3; q3 = 2 * v2 - q3; y += g3 * v1;
+        v3 = x - q4; v1 = a4 * p4 + b4 * v3; v2 = q4 + b4 * p4 + c4 * v3; p4 = 2 * v1 - p4; q4 = 2 * v2 - q4; y += g4 * v1;
+        buf[i] = y;
+      }
+      st[0] = p0; st[1] = q0; st[2] = p1; st[3] = q1; st[4] = p2; st[5] = q2; st[6] = p3; st[7] = q3; st[8] = p4; st[9] = q4;
     }
   });
 
@@ -599,6 +672,7 @@
       { id: 'env', label: 'ENV', min: -100, max: 100, def: 0, unit: '%', bipolar: true },
     ];
     init() {
+      this.ps = new MOT_PSm(this.constructor.params);
       this.st = [new Float64Array(16), new Float64Array(16)];
       this.cf = [new Float64Array(24), new Float64Array(24)];
       this.lv = new Float64Array(6);
@@ -607,13 +681,14 @@
       this.lf = 0; this.first = true; this.ev = 0;
     }
     process(L, R, n, p, ctx) {
+      p = this.ps.step(p, n, this.sr);
       const sr = this.sr, S = clamp(p.sections | 0, 2, 8);
       const ph0 = this.lfo.block(1, p.rate, 0, ctx, n, sr, false), inc = this.lfo.inc;
       const tl = Math.log(p.freq);
       if (this.first) { this.lf = tl; this.first = false; } else this.lf += (tl - this.lf) * 0.3;
       const dep = p.depth * 0.01 * 2.2 * MOT_LN2, envA = p.env * 0.01 * 3 * MOT_LN2, spr = p.spread * 0.01 * 3 * MOT_LN2;
-      const fb = p.fdbk * 0.01, og = 1 / (1 + (fb < 0 ? -fb : fb) * 0.6);
-      const K = 0.6, lv = this.lv, env = this.env, fbS = this.fbS;
+      const fb = p.fdbk * 0.01, og = 1 / (1 + Math.abs(fb) * 0.3);
+      const K = 0.4, lv = this.lv, env = this.env, fbS = this.fbS;
       for (let off = 0; off < n; off += 8) {
         const m = n - off < 8 ? n - off : 8;
         const ph = ph0 + inc * (off + m * 0.5);
@@ -670,6 +745,7 @@
       { id: 'div', label: 'DIV', div: ['8/1', '1/16'], def: '1/1' },
     ];
     init() {
+      this.ps = new MOT_PSm(this.constructor.params);
       const sr = this.sr, max = Math.ceil(sr * 0.1);
       this.dl = [new DelayLine(max), new DelayLine(max)];
       this.lfo = new MOT_LFO();
@@ -679,6 +755,7 @@
       for (const f of this.lp) f.lp(MOT_g(7000, sr), 0.6);
     }
     process(L, R, n, p, ctx) {
+      p = this.ps.step(p, n, this.sr);
       const sr = this.sr, msr = sr * 0.001, mode = p.mode | 0;
       let ph = this.lfo.block(p.sync, p.div, p.rate, ctx, n, sr, false); const inc = this.lfo.inc;
       const tms = p.time * (mode === 1 ? 0.7 : 1);
@@ -736,6 +813,7 @@
       { id: 'div', label: 'DIV', div: ['16/1', '1/4'], def: '2/1' },
     ];
     init() {
+      this.ps = new MOT_PSm(this.constructor.params);
       const sr = this.sr, sz = MOT_pow2(Math.ceil(sr * 0.05) + 8);
       this.bL = new Float32Array(sz); this.bR = new Float32Array(sz); this.m = sz - 1; this.w = 0;
       this.lfo = new MOT_LFO(); this.p2 = 0;
@@ -747,6 +825,7 @@
       this.dv = 0; this.dc = 1 - Math.exp(-1 / (0.08 * sr)); this.first = true; this.K = new Float64Array(24);
     }
     process(L, R, n, p, ctx) {
+      p = this.ps.step(p, n, this.sr);
       const sr = this.sr, msr = sr * 0.001, type = p.type | 0;
       let p1 = this.lfo.block(p.sync, p.div, p.rate1, ctx, n, sr, false); const i1 = this.lfo.inc;
       let p2 = this.p2; const i2 = p.rate2 / sr;
@@ -846,6 +925,7 @@
       { id: 'rate', label: 'RATE', min: 0.02, max: 10, def: 0.2, unit: 'Hz', curve: 'exp' },
     ];
     init() {
+      this.ps = new MOT_PSm(this.constructor.params);
       const sr = this.sr;
       this.dl = [new DelayLine(Math.ceil(sr * 0.1)), new DelayLine(Math.ceil(sr * 0.1))];
       this.lfo = new MOT_LFO();
@@ -853,6 +933,7 @@
       this.fbS = new Float64Array(2);
     }
     process(L, R, n, p, ctx) {
+      p = this.ps.step(p, n, this.sr);
       const sr = this.sr, msr = sr * 0.001;
       let ph = this.lfo.block(p.sync, p.div, p.rate, ctx, n, sr, false); const inc = this.lfo.inc;
       if (this.first) { this.bS.snap(p.delay); this.dS.snap(p.depth * 0.01); this.first = false; }
@@ -910,6 +991,7 @@
       { id: 'rate', label: 'RATE', min: 0.02, max: 10, def: 0.3, unit: 'Hz', curve: 'exp' },
     ];
     init() {
+      this.ps = new MOT_PSm(this.constructor.params);
       this.z = [new Float64Array(24), new Float64Array(24)]; // 2 chains x 12 stages
       this.fbS = new Float64Array(4);
       this.lfo = new MOT_LFO();
@@ -917,6 +999,7 @@
       this.ac = new Float64Array(4); this.wc = new Float64Array(4);
     }
     process(L, R, n, p, ctx) {
+      p = this.ps.step(p, n, this.sr);
       const sr = this.sr, S = clamp(p.stages | 0, 1, 12), barber = p.barber | 0;
       let ph = this.lfo.block(p.sync, p.div, p.rate, ctx, n, sr, false); const inc = this.lfo.inc;
       const lc = Math.log(p.center);
@@ -985,6 +1068,7 @@
       { id: 'snap', label: 'SNAP', toggle: true, def: 0 },
     ];
     init() {
+      this.ps = new MOT_PSm(this.constructor.params);
       const sr = this.sr;
       this.phL = 0; this.phR = 0.25; this.lf = Math.log(320); this.first = true;
       this.det = new MOT_SVF(); this.det.lp(MOT_g(900, sr), 0.7);
@@ -992,6 +1076,7 @@
       this.st = 0; this.cnt = 0; this.est = 220; this.snp = new MOT_Snap();
     }
     process(L, R, n, p, ctx) {
+      p = this.ps.step(p, n, this.sr);
       const sr = this.sr, track = p.track;
       // pitch tracker: low-passed mono, hysteretic zero crossings
       if (track) {
@@ -1049,31 +1134,40 @@
       { id: 'sync', label: 'SYNC', toggle: true, def: 1 },
       { id: 'rate', label: 'RATE', min: 0.05, max: 20, def: 1, unit: 'Hz', curve: 'exp' },
     ];
-    init() { this.lfo = new MOT_LFO(); this.v = 0; this.rv = 0; this.lastF = 0; this.rng = new Rng(0xa7a9); this.first = true; }
+    init() {
+      this.ps = new MOT_PSm(this.constructor.params); this.lfo = new MOT_LFO(); this.v = 0; this.rv = 0; this.lastF = 0; this.rs = 0x7a9a3c1;
+      this.first = true; this.dep = -1; this.w = -1;
+    }
     process(L, R, n, p, ctx) {
+      p = this.ps.step(p, n, this.sr);
       const sr = this.sr, shape = p.shape | 0;
       let ph = this.lfo.block(p.sync, p.div, p.rate, ctx, n, sr, true); const inc = this.lfo.inc;
       const off = p.phase / 360, dep = p.depth * 0.01, w = p.width * 0.01;
       const per = 1 / Math.max(1e-9, inc); // samples per cycle
       const sm = p.smooth * 0.01, tau = 0.0008 * sr + ((shape >= 2) ? sm * sm * 0.3 * per : 0);
       const c = 1 - Math.exp(-1 / tau);
-      let v = this.v, rv = this.rv, lastF = this.lastF;
-      if (this.first) { lastF = MOT_frac(ph + off); rv = this.rng.bi(); this.first = false; }
+      let v = this.v, rv = this.rv, lastF = this.lastF, rs = this.rs;
+      if (this.first) { lastF = MOT_frac(ph + off); rv = 0.3; this.first = false; }
+      if (this.dep < 0) { this.dep = dep; this.w = w; }
+      let d = this.dep, ww = this.w; const dInc = (dep - d) / n, wInc = (w - ww) / n; this.dep = dep; this.w = w;
       for (let i = 0; i < n; i++) {
         ph += inc; ph -= Math.floor(ph);
         const f = MOT_frac(ph + off);
+        rs ^= rs << 13; rs ^= rs >>> 17; rs ^= rs << 5;
+        rv = f < lastF ? rs * 4.656612873077393e-10 : rv; // new random position each cycle (branch-free)
         let t;
         if (shape === 0) t = Math.sin(TAU * f);
         else if (shape === 1) t = 4 * Math.abs(MOT_frac(f - 0.25) - 0.5) - 1;
         else if (shape === 2) t = f < 0.5 ? 1 : -1;
-        else { if (f < lastF) rv = this.rng.bi(); t = rv; }
+        else t = rv;
         lastF = f;
         v += (t - v) * c;
-        const a = (dep * v + 1) * MOT_QPI, gL = Math.cos(a) * MOT_SQRT2, gR = Math.sin(a) * MOT_SQRT2;
-        const xl = L[i], xr = R[i], m = 0.5 * (xl + xr), s = 0.5 * (xl - xr) * w;
+        d += dInc; ww += wInc;
+        const a = (d * v + 1) * MOT_QPI, gL = Math.cos(a) * MOT_SQRT2, gR = Math.sin(a) * MOT_SQRT2;
+        const xl = L[i], xr = R[i], m = 0.5 * (xl + xr), s = 0.5 * (xl - xr) * ww;
         L[i] = (m + s) * gL; R[i] = (m - s) * gR;
       }
-      this.v = v; this.rv = rv; this.lastF = lastF;
+      this.v = v; this.rv = rv; this.lastF = lastF; this.rs = rs;
     }
   });
 
@@ -1096,33 +1190,40 @@
       { id: 'rate', label: 'RATE', min: 0.1, max: 30, def: 5, unit: 'Hz', curve: 'exp' },
     ];
     init() {
+      this.ps = new MOT_PSm(this.constructor.params);
       this.lfo = new MOT_LFO(); this.v = new Float64Array([1, 1]); this.rv = new Float64Array([1, 1]);
-      this.lastF = new Float64Array(2); this.rng = new Rng(0x7e3e); this.first = true;
+      this.lastF = new Float64Array(2); this.rs = new Int32Array([0x3c6ef372, 0x2545f491]); this.first = true; this.dep = -1;
     }
     process(L, R, n, p, ctx) {
+      p = this.ps.step(p, n, this.sr);
       const sr = this.sr, shape = p.shape | 0;
       const ph0 = this.lfo.block(p.sync, p.div, p.rate, ctx, n, sr, true), inc = this.lfo.inc;
       const dep = p.depth * 0.01, off = p.stereo / 360, per = 1 / Math.max(1e-9, inc);
       const sm = p.smooth * 0.01, tau = 0.0006 * sr + (shape >= 2 ? sm * sm * 0.25 * per : 0);
       const c = 1 - Math.exp(-1 / tau);
       if (this.first) { this.lastF[0] = ph0; this.lastF[1] = MOT_frac(ph0 + off); this.first = false; }
+      if (this.dep < 0) this.dep = dep;
+      const d0 = this.dep, dInc = (dep - d0) / n; this.dep = dep;
       for (let ch = 0; ch < 2; ch++) {
         const buf = ch ? R : L;
-        let ph = ch ? MOT_frac(ph0 + off) : ph0, v = this.v[ch], rv = this.rv[ch], lastF = this.lastF[ch];
+        let ph = ch ? MOT_frac(ph0 + off) : ph0, v = this.v[ch], rv = this.rv[ch], lastF = this.lastF[ch], rs = this.rs[ch], d = d0;
         for (let i = 0; i < n; i++) {
           ph += inc; ph -= Math.floor(ph);
+          rs ^= rs << 13; rs ^= rs >>> 17; rs ^= rs << 5;
+          rv = ph < lastF ? (rs >>> 0) * 2.3283064365386963e-10 : rv; // new random level each cycle (branch-free)
           let t;
           if (shape === 0) t = 0.5 + 0.5 * Math.cos(TAU * ph);
           else if (shape === 1) t = Math.abs(2 * ph - 1);
           else if (shape === 2) t = ph < 0.5 ? 1 : 0;
           else if (shape === 3) t = 1 - ph;
           else if (shape === 4) t = ph;
-          else { if (ph < lastF) rv = this.rng.next(); t = rv; }
+          else t = rv;
           lastF = ph;
           v += (t - v) * c;
-          buf[i] *= 1 - dep * (1 - v);
+          d += dInc;
+          buf[i] *= 1 - d * (1 - v);
         }
-        this.v[ch] = v; this.rv[ch] = rv; this.lastF[ch] = lastF;
+        this.v[ch] = v; this.rv[ch] = rv; this.lastF[ch] = lastF; this.rs[ch] = rs;
       }
     }
   });
@@ -1145,6 +1246,7 @@
       { id: 'snap', label: 'SNAP', toggle: true, def: 0 },
     ];
     init() {
+      this.ps = new MOT_PSm(this.constructor.params);
       const sr = this.sr, sz = MOT_pow2(Math.ceil(sr * 1.02) + 8);
       this.hil = [new MOT_Hilbert(), new MOT_Hilbert()];
       this.bL = new Float32Array(sz); this.bR = new Float32Array(sz); this.m = sz - 1; this.w = 0;
@@ -1161,6 +1263,7 @@
       return this.snp[k].hz(key, ref + s) - ref;
     }
     process(L, R, n, p, ctx) {
+      p = this.ps.step(p, n, this.sr);
       const sr = this.sr, S = this.S, K = this.K;
       let sl = p.shiftl, sR = p.link ? p.shiftl : p.shiftr;
       if (p.snap) { sl = this._snap(ctx.key, sl, 0); sR = this._snap(ctx.key, sR, 1); }
@@ -1216,6 +1319,7 @@
       { id: 'rate', label: 'SPEED HZ', min: 0.05, max: 10, def: 0.5, unit: 'Hz', curve: 'exp' },
     ];
     init() {
+      this.ps = new MOT_PSm(this.constructor.params);
       const sr = this.sr;
       this.lA = [new DelayLine(Math.ceil(sr * 0.36)), new DelayLine(Math.ceil(sr * 0.36))];
       this.lB = [new DelayLine(Math.ceil(sr * 0.06)), new DelayLine(Math.ceil(sr * 0.06))];
@@ -1276,7 +1380,7 @@
         this._pos(path, t, D, k);
         const x = this.px, y = this.py;
         let dc = Math.sqrt(x * x + y * y); if (dc < 0.25) dc = 0.25;
-        let g = Math.min(1.25, Math.pow((dref + 1) / (dc + 1), 0.9));
+        let g = 1.4 * Math.min(1.25, Math.pow((dref + 1) / (dc + 1), 0.9));
         if (path === 1) { const w = Math.sin(Math.PI * MOT_frac(t + k * 0.5)); g *= w * w; }
         else if (path === 5) g *= k === 0 ? 0.6 - 0.4 * Math.cos(TAU * t) : 0.85 - 0.15 * Math.cos(TAU * this.dph);
         const pan = x / dc * width * 0.8;
@@ -1296,6 +1400,7 @@
       this.aN[0] = ca; this.aN[1] = ca;
     }
     process(L, R, n, p, ctx) {
+      p = this.ps.step(p, n, this.sr);
       const sr = this.sr, path = p.path | 0;
       const ph0 = this.lfo.block(p.sync, p.div, p.rate, ctx, n, sr, false), inc = this.lfo.inc;
       const dscale = p.depth * 0.015, width = p.width * 0.01, air = p.air * 0.01;
@@ -1361,12 +1466,14 @@
       { id: 'trail', label: 'TRAIL', min: 0, max: 95, def: 35, unit: '%' },
     ];
     init() {
+      this.ps = new MOT_PSm(this.constructor.params);
       this.z = [new Float64Array(64), new Float64Array(64)];
       this.c = [new Float64Array(64), new Float64Array(64)];
       this.fbS = new Float64Array(2);
       this.amt = -1; this.lf = 0; this.q = 0; this.sp = 0; this.active = 0;
     }
     process(L, R, n, p) {
+      p = this.ps.step(p, n, this.sr);
       const sr = this.sr;
       const tA = clamp(p.amount, 0, 32), tlf = Math.log(p.focus), tq = 0.4 * Math.pow(2, p.reso * 0.045), tsp = p.spread * 0.01;
       let dirty = false;
@@ -1392,13 +1499,17 @@
       if (nAct < this.active) for (let c = 0; c < 2; c++) this.z[c].fill(0, nAct * 2, this.active * 2);
       this.active = nAct;
       const trail = p.trail * 0.01, d = p.drive * 0.01, dm = d * 3 > 1 ? 1 : d * 3, dg = 1 + 15 * d * d, dn = 0.5 / MOT_tanh(0.5 * dg);
-      const nFull = nAct - 1;
-      for (let c = 0; c < 2; c++) {
-        const buf = c ? R : L, z = this.z[c], co = this.c[c];
+      this._k(L, n, 0, nAct, fr, trail, d, dm, dg, dn);
+      this._k(R, n, 1, nAct, fr, trail, d, dm, dg, dn);
+    }
+    // per-channel allpass chain: TDF-II 2nd-order allpasses, last stage cross-faded by the fractional AMOUNT
+    _k(buf, n, c, nAct, fr, trail, d, dm, dg, dn) {
+      const nFull = nAct - 1, z = this.z[c], co = this.c[c];
+      {
         let fbv = this.fbS[c];
         for (let i = 0; i < n; i++) {
           let x = buf[i] + trail * MOT_tanh(fbv);
-          if (d > 0) x += (MOT_tanh(x * dg) * dn - x) * dm;
+          x += (MOT_tanh(x * dg) * dn - x) * dm; // drive (dm = 0 when off)
           let y = x;
           for (let j = 0; j < nFull; j++) {
             const j2 = j * 2, c1 = co[j2], c2 = co[j2 + 1];
@@ -1443,6 +1554,7 @@
       { id: 'dial', label: 'DIAL', min: -100, max: 100, def: 0, unit: '%', bipolar: true },
     ];
     init() {
+      this.ps = new MOT_PSm(this.constructor.params);
       const sr = this.sr;
       this.bs = new Float64Array(16);   // band filter states: [ch*8 + stage*2] ic1, ic2
       this.bq = new MOT_SVF();          // coefficient scratch
@@ -1462,6 +1574,7 @@
       K[48] = Math.exp(-1 / (0.001 * sr)); K[49] = Math.exp(-1 / (0.06 * sr)); K[50] = Math.exp(-1 / (0.003 * sr)); K[51] = Math.exp(-1 / (0.15 * sr));
     }
     process(L, R, n, p) {
+      p = this.ps.step(p, n, this.sr);
       const sr = this.sr, S = this.S;
       const dial = p.dial * 0.01, ad = Math.abs(dial);
       // ---- band edges (log-smoothed per block); 24 dB/oct each side, shared by L/R
