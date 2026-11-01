@@ -1,0 +1,84 @@
+<title>DEBACLE</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<meta name="description" content="DEBACLE — a browser instrument that turns one audio loop into a performance: varispeed tape, beat-grid stutter, circuit-bent buffers, grain stretch, an effect chain, modulators and macros.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Big+Shoulders+Display:wght@600;800;900&family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans+Condensed:wght@400;500;600&display=swap">
+<style>/*__STYLE__*/</style>
+
+<div class="app">
+  <header class="top">
+    <div class="brand">
+      <svg class="reels" viewBox="0 0 64 34" width="64" height="34" aria-hidden="true">
+        <g class="reel-spin" data-cx="15" data-cy="15"><circle cx="15" cy="15" r="12.5" class="reel-o"/><circle cx="15" cy="15" r="3" class="reel-hub"/><path d="M15 15 L15 4.5 M15 15 L24.1 20.2 M15 15 L5.9 20.2" class="reel-sp"/></g>
+        <g class="reel-spin" data-cx="49" data-cy="15"><circle cx="49" cy="15" r="12.5" class="reel-o"/><circle cx="49" cy="15" r="3" class="reel-hub"/><path d="M49 15 L49 4.5 M49 15 L58.1 20.2 M49 15 L39.9 20.2" class="reel-sp"/></g>
+        <path d="M5 28 Q32 34 59 28" class="reel-tape"/>
+      </svg>
+      <div class="brand-text"><span class="wordmark">DEBACLE</span><span class="tagline">one loop · many accidents</span></div>
+    </div>
+
+    <div class="transport">
+      <button id="play" class="play" type="button" aria-pressed="false" title="Play / stop (Space)">
+        <svg class="ic-play" viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path d="M3 2 L14 8 L3 14 Z"/></svg>
+        <svg class="ic-stop" viewBox="0 0 16 16" width="13" height="13" aria-hidden="true"><rect x="2.5" y="2.5" width="11" height="11"/></svg>
+        <span class="play-label">PLAY</span>
+      </button>
+      <div class="bpm-box">
+        <label for="bpm">BPM</label>
+        <input id="bpm" type="number" min="30" max="300" step="0.1" value="96" inputmode="decimal">
+        <button id="tap" class="btn ghost sm" type="button" title="Tap tempo">TAP</button>
+      </div>
+      <div class="src-box">
+        <div id="sources" class="sources" role="group" aria-label="Source loop"></div>
+        <div class="src-wave" aria-hidden="true"><canvas id="src-wave" width="320" height="30"></canvas><i id="src-head"></i><span id="src-name"></span></div>
+      </div>
+      <div class="src-extra">
+        <button id="mic-btn" class="btn ghost sm" type="button" title="Process the live audio input instead of the loop">LIVE IN</button>
+        <button id="print-btn" class="btn ghost sm" type="button" title="Record one loop of the output and use it as the new source">PRINT</button>
+      </div>
+    </div>
+
+    <div class="presetbar">
+      <button id="preset-prev" class="icon-btn" type="button" aria-label="Previous preset">◀</button>
+      <button id="preset-open" class="preset-name" type="button" aria-haspopup="menu"><span id="preset-name">INIT</span><span id="preset-dirty" class="dirty-dot" title="Unsaved changes" hidden>●</span><span class="sel-caret" aria-hidden="true">▾</span></button>
+      <button id="preset-next" class="icon-btn" type="button" aria-label="Next preset">▶</button>
+      <button id="preset-save" class="btn ghost sm" type="button">SAVE</button>
+    </div>
+
+    <div class="globals">
+      <div id="keybox" class="keybox" role="group" aria-label="Global key"></div>
+      <div id="dicebox" class="dicebox" role="group" aria-label="Randomize"></div>
+    </div>
+
+    <div class="meter-box">
+      <canvas id="scope" width="200" height="52" aria-hidden="true"></canvas>
+      <div class="meters" aria-hidden="true"><span><i id="m-l"></i></span><span><i id="m-r"></i></span></div>
+      <span id="m-gr" class="gr" title="Output limiter is working">LIM</span>
+    </div>
+  </header>
+
+  <nav class="tabs" role="tablist" aria-label="Pages">
+    <button class="tab on" type="button" role="tab" data-page="time" aria-selected="true"><span class="tab-n">1</span>TIME</button>
+    <button class="tab" type="button" role="tab" data-page="fx" aria-selected="false"><span class="tab-n">2</span>FX</button>
+    <button class="tab" type="button" role="tab" data-page="animate" aria-selected="false"><span class="tab-n">3</span>ANIMATE</button>
+    <button class="tab" type="button" role="tab" data-page="perform" aria-selected="false"><span class="tab-n">4</span>PERFORM</button>
+    <div id="info" class="info" aria-live="polite"><span class="info-name"></span><span class="info-val"></span></div>
+  </nav>
+
+  <main>
+    <section id="page-time" class="page" role="tabpanel" aria-label="Time engines"></section>
+    <section id="page-fx" class="page" role="tabpanel" aria-label="Effect chain" hidden></section>
+    <section id="page-animate" class="page" role="tabpanel" aria-label="Modulation" hidden></section>
+    <section id="page-perform" class="page" role="tabpanel" aria-label="Performance" hidden></section>
+  </main>
+
+  <footer class="mainrow">
+    <div class="mainrow-title"><span class="panel-title">MAIN</span><span class="muted small">last stage · soft limiter</span></div>
+    <div id="mainrow-ctl" class="mainrow-ctl"></div>
+    <div class="status"><span id="engine-mode" class="pill" title="Audio engine">AUDIO OFF</span><span id="lat" class="muted small"></span></div>
+  </footer>
+  <div class="drop-hint" aria-hidden="true">Drop an audio file to load it as the loop</div>
+</div>
+
+<script id="dsp-src" type="text/plain">/*__DSP__*/</script>
+<script>/*__APP__*/</script>
