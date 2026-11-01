@@ -612,18 +612,22 @@
       this.ps = new MOT_PSm(this.constructor.params);
       this.st = [new Float64Array(10), new Float64Array(10)];
       this.cf = [new Float64Array(20), new Float64Array(20)];
-      this.pv = 0; this.first = true;
+      this.pv = 0; this.first = true; this.prev = new Float64Array([-1, 0, 0]);
     }
     process(L, R, n, p, ctx) {
       p = this.ps.step(p, n, this.sr);
       const sr = this.sr, V = MOT_VOICES[p.voice | 0] || MOT_VOICES[0];
       const base = p.vowel * 0.04;
-      const qs = Math.pow(2, (0.5 - p.q * 0.01) * 3.2);
-      const shL = p.shift / 12 * MOT_LN2, sp = p.spread * 0.01;
+      // Q / SHIFT / SPREAD are interpolated across the block (coefficients update every 16 samples)
+      const pv = this.prev; if (pv[0] < 0) { pv[0] = p.q; pv[1] = p.shift; pv[2] = p.spread; }
+      const q0 = pv[0], h0 = pv[1], s0 = pv[2], qd = p.q - q0, hd = p.shift - h0, sd = p.spread - s0;
+      pv[0] = p.q; pv[1] = p.shift; pv[2] = p.spread;
       const gc = 1 - Math.exp(-16 / (Math.max(1, p.glide) * 0.001 * sr));
       const mk = 5.8 * (MOT_VOICE_GAIN[p.voice | 0] || 1); // make-up: five narrow bands keep only a fraction of broadband energy
       for (let off = 0; off < n; off += 16) {
-        const m = n - off < 16 ? n - off : 16;
+        const m = n - off < 16 ? n - off : 16, fr0 = (off + m) / n;
+        const qs = Math.pow(2, (0.5 - (q0 + qd * fr0) * 0.01) * 3.2), shL = (h0 + hd * fr0) / 12 * MOT_LN2, sp = (s0 + sd * fr0) * 0.01;
+        const mkq = mk * Math.sqrt(0.8950 / qs); // broadband energy ~ bandwidth: keep level steady across Q
         let tgt = base;
         if (p.seq) { const b = p.rate > 1e-4 ? p.rate : 1e-4; tgt += Math.floor((ctx.ppq + off / ctx.spb) / b + 1e-9); }
         tgt -= 5 * Math.floor(tgt / 5);
@@ -644,7 +648,7 @@
             let k = (V[o0 + 2] + (V[o1 + 2] - V[o0 + 2]) * fr) * qs / F;
             k = Math.max(0.015, Math.min(1.6, k));
             const g = MOT_g(F, sr), a1 = 1 / (1 + g * (g + k)), o = j * 4;
-            cf[o] = a1; cf[o + 1] = g * a1; cf[o + 2] = g * g * a1; cf[o + 3] = amp * k * mk;
+            cf[o] = a1; cf[o + 1] = g * a1; cf[o + 2] = g * g * a1; cf[o + 3] = amp * k * mkq;
           }
         }
         this._k(L, this.cf[0], this.st[0], off, off + m);
@@ -690,55 +694,64 @@
     ];
     init() {
       this.ps = new MOT_PSm(this.constructor.params);
-      this.st = [new Float64Array(16), new Float64Array(16)];
-      this.cf = [new Float64Array(24), new Float64Array(24)];
+      this.st = [new Float64Array(18), new Float64Array(18)];
+      this.cf = [new Float64Array(27), new Float64Array(27)];
       this.lv = new Float64Array(6);
       this.fbS = new Float64Array(2);
-      this.lfo = new MOT_LFO(); this.env = new EnvFollower(this.sr, 4, 160);
-      this.lf = 0; this.first = true; this.ev = 0;
+      this.lfo = new MOT_LFO(); this.cnt = new MOT_FracCount();
+      this.ea = Math.exp(-1 / (0.004 * this.sr)); this.er = Math.exp(-1 / (0.16 * this.sr));
+      this.lf = 0; this.first = true; this.ev = 0; this.fb = 0; this.og = 1;
     }
     process(L, R, n, p, ctx) {
       p = this.ps.step(p, n, this.sr);
-      const sr = this.sr, S = clamp(p.sections | 0, 2, 8);
+      const sr = this.sr, cnt = this.cnt;
+      const nb = cnt.step(p.sections, 8, 0.34), Sv = Math.max(2, cnt.v);
+      for (let c = 0; c < 2; c++) this.st[c].fill(0, (nb + 1) * 2, 18);
       const ph0 = this.lfo.block(1, p.rate, 0, ctx, n, sr, false), inc = this.lfo.inc;
-      const tl = Math.log(p.freq);
-      if (this.first) { this.lf = tl; this.first = false; } else this.lf += (tl - this.lf) * 0.3;
+      const tl = Math.log(p.freq), fbT = p.fdbk * 0.01, ogT = 1 / (1 + Math.abs(fbT) * 0.3);
+      if (this.first) { this.lf = tl; this.fb = fbT; this.og = ogT; this.first = false; } else this.lf += (tl - this.lf) * 0.3;
       const dep = p.depth * 0.01 * 2.2 * MOT_LN2, envA = p.env * 0.01 * 3 * MOT_LN2, spr = p.spread * 0.01 * 3 * MOT_LN2;
-      const fb = p.fdbk * 0.01, og = 1 / (1 + Math.abs(fb) * 0.3);
-      const K = 0.4, lv = this.lv, env = this.env, fbS = this.fbS;
+      const K = 0.4, lv = this.lv, ea = this.ea, er = this.er;
+      const fwI = (cnt.f1 - cnt.f0) / n, fbI = (fbT - this.fb) / n, ogI = (ogT - this.og) / n;
       for (let off = 0; off < n; off += 8) {
-        const m = n - off < 8 ? n - off : 8;
+        const e = Math.min(n, off + 8), m = e - off;
         const ph = ph0 + inc * (off + m * 0.5);
         for (let c = 0; c < 2; c++) for (let g = 0; g < 3; g++) lv[c * 3 + g] = Math.sin(TAU * (ph + g / 3 + (c ? 1 / 6 : 0)));
         const eo = envA * this.ev;
         for (let c = 0; c < 2; c++) {
           const cf = this.cf[c];
-          for (let j = 0; j < S; j++) {
-            const lf = this.lf + dep * lv[c * 3 + (j % 3)] + eo + spr * (j / (S - 1) - 0.5);
+          for (let j = 0; j <= nb; j++) {
+            const lf = this.lf + dep * lv[c * 3 + (j % 3)] + eo + spr * (j / (Sv - 1) - 0.5);
             const g = MOT_g(Math.exp(lf), sr), a1 = 1 / (1 + g * (g + K)), o = j * 3;
             cf[o] = a1; cf[o + 1] = g * a1; cf[o + 2] = g * g * a1;
           }
         }
-        const e = off + m;
         let ev = this.ev;
-        for (let i = off; i < e; i++) {
-          const xl = L[i], xr = R[i];
-          ev = env.process(0.5 * (xl + xr));
-          for (let c = 0; c < 2; c++) {
-            const cf = this.cf[c], st = this.st[c];
-            let x = (c ? xr : xl) + fb * MOT_tanh(fbS[c]);
-            for (let j = 0; j < S; j++) {
-              const o = j * 3, s = j * 2, ic1 = st[s], ic2 = st[s + 1];
-              const v3 = x - ic2, v1 = cf[o] * ic1 + cf[o + 1] * v3, v2 = ic2 + cf[o + 1] * ic1 + cf[o + 2] * v3;
-              st[s] = 2 * v1 - ic1; st[s + 1] = 2 * v2 - ic2;
-              x -= K * v1;
-            }
-            fbS[c] = x;
-            if (c) R[i] = x * og; else L[i] = x * og;
-          }
-        }
+        for (let i = off; i < e; i++) { const a = Math.abs(L[i] + R[i]) * 0.5; ev = a + (a > ev ? ea : er) * (ev - a); }
         this.ev = ev;
+        const f0 = cnt.f0 + fwI * off, b0 = this.fb + fbI * off, o0 = this.og + ogI * off;
+        this._k(L, 0, off, e, nb, f0, fwI, b0, fbI, o0, ogI);
+        this._k(R, 1, off, e, nb, f0, fwI, b0, fbI, o0, ogI);
       }
+      this.fb = fbT; this.og = ogT;
+    }
+    // notch cascade: nb full sections + one partially blended section; soft-clipped feedback
+    _k(buf, c, i0, i1, nb, fw, fwI, fb, fbI, og, ogI) {
+      const cf = this.cf[c], st = this.st[c], K = 0.4;
+      let fs = this.fbS[c];
+      for (let i = i0; i < i1; i++) {
+        fw += fwI; fb += fbI; og += ogI;
+        let x = buf[i] + fb * MOT_tanh(fs);
+        for (let j = 0; j <= nb; j++) {
+          const o = j * 3, s = j * 2, ic1 = st[s], ic2 = st[s + 1];
+          const v3 = x - ic2, v1 = cf[o] * ic1 + cf[o + 1] * v3, v2 = ic2 + cf[o + 1] * ic1 + cf[o + 2] * v3;
+          st[s] = 2 * v1 - ic1; st[s + 1] = 2 * v2 - ic2;
+          x -= (j < nb ? K : K * fw) * v1;
+        }
+        fs = x;
+        buf[i] = x * og;
+      }
+      this.fbS[c] = fs;
     }
   });
 
@@ -767,7 +780,7 @@
       this.dl = [new DelayLine(max), new DelayLine(max)];
       this.lfo = new MOT_LFO();
       this.tS = new Smoother(sr, 60, 12); this.aS = new Smoother(sr, 60, 0); this.first = true;
-      this.fbL = 0; this.fbR = 0;
+      this.fbL = 0; this.fbR = 0; this.fbv = -10; this.wv = 0;
       this.lp = [new MOT_SVF(), new MOT_SVF()];
       for (const f of this.lp) f.lp(MOT_g(7000, sr), 0.6);
     }
@@ -778,11 +791,15 @@
       const tms = p.time * (mode === 1 ? 0.7 : 1);
       const amp = p.depth * 0.01 * Math.min(p.time * 0.45, 8) * (mode === 1 ? 0.45 : 1);
       if (this.first) { this.tS.snap(tms); this.aS.snap(amp); this.first = false; } else { this.tS.set(tms); this.aS.set(amp); }
-      const fb = p.fdbk * 0.01, w = p.width * 0.01, wa = 0.5 + 0.5 * w, wb = 0.5 - 0.5 * w;
+      const fbT = p.fdbk * 0.01, wT = p.width * 0.01;
+      if (this.fbv < -9) { this.fbv = fbT; this.wv = wT; }
+      let fb = this.fbv, w = this.wv; const fbI = (fbT - fb) / n, wI = (wT - w) / n; this.fbv = fbT; this.wv = wT;
       const dlL = this.dl[0], dlR = this.dl[1], tS = this.tS, aS = this.aS, lpL = this.lp[0], lpR = this.lp[1];
       let fbL = this.fbL, fbR = this.fbR;
       for (let i = 0; i < n; i++) {
         ph += inc; ph -= Math.floor(ph);
+        fb += fbI; w += wI;
+        const wa = 0.5 + 0.5 * w, wb = 0.5 - 0.5 * w;
         const T = tS.next() * msr, A = aS.next() * msr;
         const xl = L[i], xr = R[i];
         dlL.write(xl + fb * MOT_tanh(fbL)); dlR.write(xr + fb * MOT_tanh(fbR));
@@ -839,7 +856,7 @@
       this.st = new Float64Array(8);   // lp ic1/ic2 L,R; feedback L,R; env; spare
       this.ea = Math.exp(-1 / (0.005 * sr)); this.er = Math.exp(-1 / (0.2 * sr));
       this.rng = new Rng(0xe95e); this.rs = 0x6a09e667; this.wr = 0; this.wt = 0; this.wc = 0;
-      this.dv = 0; this.dc = 1 - Math.exp(-1 / (0.08 * sr)); this.first = true; this.K = new Float64Array(24);
+      this.dv = 0; this.dc = 1 - Math.exp(-1 / (0.08 * sr)); this.first = true; this.K = new Float64Array(24); this.sat0 = -1;
     }
     process(L, R, n, p, ctx) {
       p = this.ps.step(p, n, this.sr);
@@ -866,13 +883,16 @@
       K[0] = type; K[1] = p1; K[2] = i1; K[3] = p2; K[4] = i2; K[5] = dep; K[6] = fb; K[7] = base; K[8] = A1; K[9] = A2;
       K[10] = la1; K[11] = la2; K[12] = la3; K[13] = sat; K[14] = satN; K[15] = nz; K[16] = this.wr * 0.5 * msr; K[17] = 0.4 * msr;
       K[18] = 1 - 0.5 * (1 - w); K[19] = 0.3 * w;
+      if (this.sat0 < 0) this.sat0 = sat;
+      K[20] = this.sat0; K[21] = (sat - this.sat0) / n; this.sat0 = sat;
       this._k(L, R, n);
       this.p2 = MOT_frac(p2 + i2 * n);
     }
     // per-sample kernel (compact, so the JIT tiers it up quickly)
     _k(L, R, n) {
       const K = this.K, rot = this.rot, type = K[0], i1 = K[2], i2 = K[4], dep = K[5], fb = K[6], base = K[7], A1 = K[8], A2 = K[9];
-      const la1 = K[10], la2 = K[11], la3 = K[12], sat = K[13], satN = K[14], nz = K[15], wr = K[16], sp = K[17], ms = K[18], dxw = K[19];
+      const la1 = K[10], la2 = K[11], la3 = K[12], satI = K[21], nz = K[15], wr = K[16], sp = K[17], ms = K[18], dxw = K[19];
+      let sat = K[20];
       let p1 = K[1], p2 = K[3];
       const bL = this.bL, bR = this.bR, m = this.m, st = this.st, ea = this.ea, er = this.er, dc = this.dc;
       const r0 = rot[0], r1 = rot[1], r2 = rot[2], r3 = rot[3], r4 = rot[4], r5 = rot[5];
@@ -909,7 +929,7 @@
         let v3 = oL - l2, v1 = la1 * l1 + la2 * v3, v2 = l2 + la2 * l1 + la3 * v3; l1 = 2 * v1 - l1; l2 = 2 * v2 - l2; oL = v2;
         v3 = oR - q2; v1 = la1 * q1 + la2 * v3; v2 = q2 + la2 * q1 + la3 * v3; q1 = 2 * v1 - q1; q2 = 2 * v2 - q2; oR = v2;
         rs ^= rs << 13; rs ^= rs >>> 17; rs ^= rs << 5;
-        const ne = nz * env;
+        const ne = nz * env; sat += satI; const satN = 1 / sat;
         oL = MOT_tanh(oL * sat) * satN + ((rs & 0xffff) - 32768) * ne;
         oR = MOT_tanh(oR * sat) * satN + ((rs >>> 16) - 32768) * ne;
         if (type === 2) { L[i] = 0.6 * xl + 0.6 * oL - dxw * oR; R[i] = 0.6 * xr + 0.6 * oR - dxw * oL; }
@@ -947,7 +967,7 @@
       this.dl = [new DelayLine(Math.ceil(sr * 0.1)), new DelayLine(Math.ceil(sr * 0.1))];
       this.lfo = new MOT_LFO();
       this.bS = new Smoother(sr, 40, 0.7); this.dS = new Smoother(sr, 40, 0.75); this.first = true;
-      this.fbS = new Float64Array(2);
+      this.fbS = new Float64Array(2); this.fbv = -10; this.sg = 0;
     }
     process(L, R, n, p, ctx) {
       p = this.ps.step(p, n, this.sr);
@@ -955,10 +975,15 @@
       let ph = this.lfo.block(p.sync, p.div, p.rate, ctx, n, sr, false); const inc = this.lfo.inc;
       if (this.first) { this.bS.snap(p.delay); this.dS.snap(p.depth * 0.01); this.first = false; }
       else { this.bS.set(p.delay); this.dS.set(p.depth * 0.01); }
-      const fb = p.fdbk * 0.01, sg = fb < 0 ? -1 : 1, barber = p.barber | 0, tzf = p.tzf && !barber;
+      const fbT = p.fdbk * 0.01, barber = p.barber | 0, tzf = p.tzf && !barber;
+      if (this.fbv < -9) this.fbv = fbT;
+      let fb = this.fbv, sg = this.sg; const fbI = (fbT - fb) / n, sgT = fbT < 0 ? -1 : 1, sgR = 1 / (0.005 * sr); this.fbv = fbT;
+      if (sg === 0) sg = sgT;
       const wo = p.width * 0.005, fbS = this.fbS, bS = this.bS, dS = this.dS;
       for (let i = 0; i < n; i++) {
         ph += inc; ph -= Math.floor(ph);
+        fb += fbI;
+        sg += Math.max(-sgR, Math.min(sgR, sgT - sg)); // wet polarity follows the FDBK sign, slewed over ~5 ms
         const base = bS.next() * msr, dep = dS.next();
         for (let c = 0; c < 2; c++) {
           const buf = c ? R : L, dl = this.dl[c], x = buf[i];
@@ -984,6 +1009,7 @@
           buf[i] = 0.5 * (dry + sg * wet);
         }
       }
+      this.sg = sg;
     }
   });
 
@@ -1009,23 +1035,35 @@
     ];
     init() {
       this.ps = new MOT_PSm(this.constructor.params);
-      this.z = [new Float64Array(24), new Float64Array(24)]; // 2 chains x 12 stages
+      this.z = [new Float64Array(26), new Float64Array(26)]; // 2 chains x 13 (12 stages + spare)
       this.fbS = new Float64Array(4);
-      this.lfo = new MOT_LFO();
+      this.lfo = new MOT_LFO(); this.cnt = new MOT_FracCount();
       this.cS = new Smoother(this.sr, 40, Math.log(700)); this.first = true;
-      this.ac = new Float64Array(4); this.wc = new Float64Array(4);
+      this.ac = new Float64Array(4); this.wc = new Float64Array(4); this.K = new Float64Array(16); this.fb = 0;
     }
     process(L, R, n, p, ctx) {
       p = this.ps.step(p, n, this.sr);
-      const sr = this.sr, S = clamp(p.stages | 0, 1, 12), barber = p.barber | 0;
-      let ph = this.lfo.block(p.sync, p.div, p.rate, ctx, n, sr, false); const inc = this.lfo.inc;
+      const sr = this.sr, barber = p.barber | 0, cnt = this.cnt;
+      const nb = cnt.step(p.stages, 12, 0.34);
+      for (let c = 0; c < 2; c++) { this.z[c].fill(0, nb + 1, 13); this.z[c].fill(0, 13 + nb + 1, 26); }
+      const ph = this.lfo.block(p.sync, p.div, p.rate, ctx, n, sr, false);
       const lc = Math.log(p.center);
-      if (this.first) { this.cS.snap(lc); this.first = false; } else this.cS.set(lc);
-      const dep = p.depth * 0.01, fb = p.fdbk * 0.01, wo = p.width * 0.005, fbS = this.fbS, cS = this.cS;
-      const piSr = Math.PI / sr, oc = (1 + dep * 4) * MOT_LN2, sw = dep * 2.5 * MOT_LN2, fmax = sr * 0.45;
-      const ac = this.ac, wc = this.wc;
+      if (this.first) { this.cS.snap(lc); this.fb = p.fdbk * 0.01; this.first = false; } else this.cS.set(lc);
+      const dep = p.depth * 0.01, K = this.K;
+      K[0] = ph; K[1] = this.lfo.inc; K[2] = barber; K[3] = nb; K[4] = cnt.f0; K[5] = cnt.f1;
+      K[6] = this.fb; K[7] = p.fdbk * 0.01; K[8] = p.width * 0.005; K[9] = (1 + dep * 4) * MOT_LN2; K[10] = dep * 2.5 * MOT_LN2;
+      this.fb = K[7];
+      this._k(L, R, n);
+    }
+    // allpass chains: nb full stages + one partial stage (fractional count), feedback, barber cross-fade
+    _k(L, R, n) {
+      const K = this.K, sr = this.sr, inc = K[1], barber = K[2], nb = K[3], fI = (K[5] - K[4]) / n, fbI = (K[7] - K[6]) / n;
+      const wo = K[8], oc = K[9], sw = K[10], piSr = Math.PI / sr, fmax = sr * 0.45;
+      const ac = this.ac, wc = this.wc, fbS = this.fbS, cS = this.cS, zL = this.z[0], zR = this.z[1];
+      let ph = K[0], fw = K[4], fb = K[6];
       for (let i = 0; i < n; i++) {
         ph += inc; ph -= Math.floor(ph);
+        fw += fI; fb += fbI;
         const lcv = cS.next();
         if ((i & 3) === 0) { // allpass coefficients (and barber weights) every 4 samples
           for (let c = 0; c < 2; c++) {
@@ -1043,24 +1081,17 @@
           }
         }
         for (let c = 0; c < 2; c++) {
-          const buf = c ? R : L, z = this.z[c], x = buf[i];
-          if (!barber) {
-            const a = ac[c * 2];
-            let y = x + fb * MOT_tanh(fbS[c]);
-            for (let j = 0; j < S; j++) { const o = a * y + z[j]; z[j] = y - a * o; y = o; }
-            fbS[c] = y;
-            buf[i] = 0.5 * (x + y);
-          } else {
-            let acc = 0;
-            for (let h = 0; h < 2; h++) {
-              const a = ac[c * 2 + h], zo = h * 12, fi = c * 2 + h;
-              let y = x + fb * MOT_tanh(fbS[fi]);
-              for (let j = 0; j < S; j++) { const o = a * y + z[zo + j]; z[zo + j] = y - a * o; y = o; }
-              fbS[fi] = y;
-              acc += y * wc[fi];
-            }
-            buf[i] = 0.5 * (x + acc);
+          const buf = c ? R : L, z = c ? zR : zL, x = buf[i];
+          let acc = 0;
+          for (let h = 0; h <= (barber ? 1 : 0); h++) {
+            const a = ac[c * 2 + h], zo = h * 13, fi = c * 2 + h;
+            let y = x + fb * MOT_tanh(fbS[fi]);
+            for (let j = 0; j < nb; j++) { const o = a * y + z[zo + j]; z[zo + j] = y - a * o; y = o; }
+            const o = a * y + z[zo + nb]; z[zo + nb] = y - a * o; y += (o - y) * fw;
+            fbS[fi] = y;
+            acc += barber ? y * wc[fi] : y;
           }
+          buf[i] = 0.5 * (x + acc);
         }
       }
     }
@@ -1090,7 +1121,7 @@
       this.phL = 0; this.phR = 0.25; this.lf = Math.log(320); this.first = true;
       this.det = new MOT_SVF(); this.det.lp(MOT_g(900, sr), 0.7);
       this.dc = new DCBlock(0.995); this.env = new EnvFollower(sr, 2, 80);
-      this.st = 0; this.cnt = 0; this.est = 220; this.snp = new MOT_Snap();
+      this.st = 0; this.cnt = 0; this.est = 220.5; this.snp = new MOT_Snap(); this.sh = -1; this.b = 0;
     }
     process(L, R, n, p, ctx) {
       p = this.ps.step(p, n, this.sr);
@@ -1118,15 +1149,19 @@
       if (this.first) { this.lf = lt; this.first = false; } else this.lf += (lt - this.lf) * (track ? 0.2 : 0.5);
       const fc = Math.exp(this.lf), r = Math.pow(2, p.spread * 0.01 * 0.75 / 12);
       const iL = fc / r / sr, iR = fc * r / sr;
-      const sh = p.shape * 0.01, sd = 1 + sh * sh * 20, sn = 1 / MOT_tanh(sd);
-      const b = p.bias * 0.01, cg = 1 - 0.5 * b, co = 0.5 * b, mk = 1.25 - 0.25 * b;
+      // shape (sine -> square) and bias (ring -> AM) are ramped per sample: carrier = mix(sin, sq) * cg + co
+      const sh = p.shape * 0.01, b = p.bias * 0.01;
+      if (this.sh < 0) { this.sh = sh; this.b = b; }
+      let s0 = this.sh, b0 = this.b; const sI = (sh - s0) / n, bI = (b - b0) / n; this.sh = sh; this.b = b;
       let phL = this.phL, phR = this.phR;
       for (let i = 0; i < n; i++) {
         phL += iL; phL -= Math.floor(phL);
         phR += iR; phR -= Math.floor(phR);
-        let cl = Math.sin(TAU * phL), cr = Math.sin(TAU * phR);
-        if (sh > 0) { cl = MOT_tanh(cl * sd) * sn; cr = MOT_tanh(cr * sd) * sn; }
-        L[i] *= (cl * cg + co) * mk; R[i] *= (cr * cg + co) * mk;
+        s0 += sI; b0 += bI;
+        const sl = Math.sin(TAU * phL), sr2 = Math.sin(TAU * phR), w = Math.sqrt(s0);
+        const cl = sl + (MOT_tanh(sl * 12) - sl) * w, cr = sr2 + (MOT_tanh(sr2 * 12) - sr2) * w;
+        const cg = (1 - 0.5 * b0) * (1.25 - 0.25 * b0), co = 0.5 * b0 * (1.25 - 0.25 * b0);
+        L[i] *= cl * cg + co; R[i] *= cr * cg + co;
       }
       this.phL = phL; this.phR = phR;
     }
@@ -1268,7 +1303,7 @@
       this.hil = [new MOT_Hilbert(), new MOT_Hilbert()];
       this.bL = new Float32Array(sz); this.bR = new Float32Array(sz); this.m = sz - 1; this.w = 0;
       // state: 0..1 shift (Hz, block-smoothed) L/R, 2..3 delay (smp) L/R, 4..7 phasors cos/sin L, R, 8..9 loop LP
-      const S = this.S = new Float64Array(12); S[4] = 1; S[6] = 1;
+      const S = this.S = new Float64Array(12); S[4] = 1; S[6] = 1; S[10] = -1;
       this.K = new Float64Array(12);
       this.first = true;
       this.snp = [new MOT_Snap(), new MOT_Snap()];
@@ -1293,17 +1328,18 @@
         const a = TAU * S[c] / sr, o = 4 + c * 2, nr = 1 / Math.hypot(S[o], S[o + 1]);
         S[o] *= nr; S[o + 1] *= nr; K[c * 2] = Math.cos(a); K[c * 2 + 1] = Math.sin(a);
       }
-      K[4] = p.fdbk * 0.01; K[5] = T;
+      if (S[10] < 0) S[10] = p.fdbk * 0.01;
+      K[4] = S[10]; K[6] = (p.fdbk * 0.01 - S[10]) / n; K[5] = T; S[10] = p.fdbk * 0.01;
       this._k(L, n, 0); this._k(R, n, 1);
       this.w = (this.w + n) & this.m;
     }
     // per-channel kernel: feedback delay -> Hilbert pair -> complex rotation
     _k(buf, n, c) {
       const S = this.S, K = this.K, hil = this.hil[c], b = c ? this.bR : this.bL, m = this.m;
-      const rc = K[c * 2], rsn = K[c * 2 + 1], fb = K[4], T = K[5], lc = this.lc, tc = this.tc, o = 4 + c * 2;
-      let w = this.w, d = S[2 + c], oc = S[o], os = S[o + 1], lp = S[8 + c];
+      const rc = K[c * 2], rsn = K[c * 2 + 1], fbI = K[6], T = K[5], lc = this.lc, tc = this.tc, o = 4 + c * 2;
+      let w = this.w, d = S[2 + c], oc = S[o], os = S[o + 1], lp = S[8 + c], fb = K[4];
       for (let i = 0; i < n; i++) {
-        d += (T - d) * tc;
+        d += (T - d) * tc; fb += fbI;
         lp += lc * (MOT_rd(b, m, w, d) - lp);
         hil.process(buf[i] + fb * MOT_tanh(lp));
         const t = oc * rc - os * rsn; os = os * rc + oc * rsn; oc = t;
@@ -1349,7 +1385,7 @@
       this.xo = new Float64Array(2); this.xoc = 1 - Math.exp(-TAU * 800 / sr);
       this.rx = new Float64Array(4); this.rt = new Float64Array(2); this.rseg = -1;
       this.rng = new Rng(0xd0bb1e);
-      this.path = -1; this.fade = 0; this.Ds = 8; this.first = true;
+      this.path = -1; this.fade = 0; this.Ds = 8; this.first = true; this.dsc = 0.9; this.wid = 0.7;
     }
     // source position (x right, y front) for source k at path phase t; returns [x,y] in this.px/py
     _pos(path, t, D, k) {
@@ -1431,11 +1467,13 @@
         if (path !== this.path) { this.fade -= m / 384; if (this.fade <= 0) { this.fade = 0; this.path = path; this.rseg = -1; this.first = true; } }
         else if (this.fade < 1) { this.fade += m / 384; if (this.fade > 1) this.fade = 1; }
         this.Ds += (p.distance - this.Ds) * (1 - Math.exp(-m / (0.25 * sr)));
+        const gk = this.first ? 1 : 1 - Math.exp(-m / (0.15 * sr));
+        this.dsc += (dscale - this.dsc) * gk; this.wid += (width - this.wid) * gk;
         this.dph = MOT_frac(this.dph + inc * 0.9 * m);
         if (this.first && this.path === 4) {
           const rx = this.rx, D = this.Ds; rx[0] = rx[2] = 0.3 * D; rx[1] = rx[3] = 0.6 * D;
         }
-        this._ctl(MOT_frac(ph0 + inc * (off + m)), m, dscale, width, air, sr);
+        this._ctl(MOT_frac(ph0 + inc * (off + m)), m, this.dsc, this.wid, air, sr);
         if (this.first) { dP.set(dN); gP.set(gN); aP.set(aN); this.first = false; }
         const rotor = this.path === 5, im = 1 / m;
         const dd0 = (dN[0] - dP[0]) * im, dd1 = (dN[1] - dP[1]) * im, dd2 = (dN[2] - dP[2]) * im, dd3 = (dN[3] - dP[3]) * im;
@@ -1484,69 +1522,75 @@
     ];
     init() {
       this.ps = new MOT_PSm(this.constructor.params);
-      this.z = [new Float64Array(64), new Float64Array(64)];
-      this.c = [new Float64Array(64), new Float64Array(64)];
-      this.fbS = new Float64Array(2);
-      this.amt = -1; this.lf = 0; this.q = 0; this.sp = 0; this.active = 0;
+      this.z = [new Float64Array(66), new Float64Array(66)];
+      this.c = [new Float64Array(66), new Float64Array(66)];
+      this.fbS = new Float64Array(2); this.cnt = new MOT_FracCount();
+      this.g = new Float64Array(4); // ramped: trail, drive mix, drive gain, drive norm
+      this.lf = 0; this.q = 0; this.sp = 0; this.first = true; this.nb = -1;
+      this.c32 = 1 - Math.exp(-32 / (0.015 * this.sr));
+    }
+    _coefs(nb) {
+      const sr = this.sr;
+      for (let c = 0; c < 2; c++) {
+        const co = this.c[c], sg = c ? -1 : 1;
+        for (let j = 0; j <= nb && j < 32; j++) {
+          const f = clamp(Math.exp(this.lf + this.sp * 2 * MOT_LN2 * MOT_DU[j] * sg), 20, sr * 0.45);
+          const w = TAU * f / sr, al = Math.sin(w) / (2 * this.q), a0 = 1 + al;
+          co[j * 2] = -2 * Math.cos(w) / a0; co[j * 2 + 1] = (1 - al) / a0;
+        }
+      }
     }
     process(L, R, n, p) {
       p = this.ps.step(p, n, this.sr);
-      const sr = this.sr;
-      const tA = clamp(p.amount, 0, 32), tlf = Math.log(p.focus), tq = 0.4 * Math.pow(2, p.reso * 0.045), tsp = p.spread * 0.01;
-      let dirty = false;
-      if (this.amt < 0) { this.amt = tA; this.lf = tlf; this.q = tq; this.sp = tsp; dirty = true; }
-      else {
-        if (this.amt !== tA) { this.amt += (tA - this.amt) * 0.2; if (Math.abs(tA - this.amt) < 0.01) this.amt = tA; }
-        if (this.lf !== tlf) { this.lf += (tlf - this.lf) * 0.3; if (Math.abs(tlf - this.lf) < 1e-4) this.lf = tlf; dirty = true; }
-        if (this.q !== tq) { this.q += (tq - this.q) * 0.3; if (Math.abs(tq - this.q) < 1e-4) this.q = tq; dirty = true; }
-        if (this.sp !== tsp) { this.sp += (tsp - this.sp) * 0.3; if (Math.abs(tsp - this.sp) < 1e-4) this.sp = tsp; dirty = true; }
+      const tlf = Math.log(p.focus), tq = 0.4 * Math.pow(2, p.reso * 0.045), tsp = p.spread * 0.01, cnt = this.cnt;
+      const nb = cnt.step(p.amount, 32, 0.5);
+      const d = p.drive * 0.01, g = this.g, t0 = p.trail * 0.01, t1 = Math.min(1, d * 3), t2 = 1 + 15 * d * d, t3 = 0.5 / MOT_tanh(0.5 * t2);
+      if (this.first) { this.lf = tlf; this.q = tq; this.sp = tsp; g[0] = t0; g[1] = t1; g[2] = t2; g[3] = t3; this._coefs(nb); this.first = false; }
+      if (nb !== this.nb) {
+        if (nb > this.nb) this._coefs(nb);
+        for (let c = 0; c < 2; c++) this.z[c].fill(0, (nb + 1) * 2, 66);
+        this.nb = nb;
       }
-      const amt = this.amt, nAct = Math.ceil(amt - 1e-9), fr = nAct > 0 ? amt - (nAct - 1) : 0;
-      if (nAct > this.active) dirty = true;
-      if (dirty) {
-        for (let c = 0; c < 2; c++) {
-          const co = this.c[c], sg = c ? -1 : 1;
-          for (let j = 0; j < nAct; j++) {
-            const f = clamp(Math.exp(this.lf + this.sp * 2 * MOT_LN2 * MOT_DU[j] * sg), 20, sr * 0.45);
-            const w = TAU * f / sr, al = Math.sin(w) / (2 * this.q), a0 = 1 + al;
-            co[j * 2] = -2 * Math.cos(w) / a0; co[j * 2 + 1] = (1 - al) / a0;
-          }
+      const moving = this.lf !== tlf || this.q !== tq || this.sp !== tsp, steps = moving ? 4 : 1, m = n / steps, c32 = this.c32;
+      const fI = (cnt.f1 - cnt.f0) / n, i0 = (t0 - g[0]) / n, i1 = (t1 - g[1]) / n, i2 = (t2 - g[2]) / n, i3 = (t3 - g[3]) / n;
+      for (let k = 0; k < steps; k++) {
+        if (moving) { // glide focus / reso / spread with coefficient updates every 32 samples
+          this.lf += (tlf - this.lf) * c32; this.q += (tq - this.q) * c32; this.sp += (tsp - this.sp) * c32;
+          if (Math.abs(tlf - this.lf) < 1e-4) this.lf = tlf; if (Math.abs(tq - this.q) < 1e-4) this.q = tq; if (Math.abs(tsp - this.sp) < 1e-4) this.sp = tsp;
+          this._coefs(nb);
         }
+        const a = Math.round(k * m), e = Math.round((k + 1) * m), f0 = cnt.f0 + fI * a;
+        this._k(L, 0, a, e, nb, f0, fI, g, a, i0, i1, i2, i3);
+        this._k(R, 1, a, e, nb, f0, fI, g, a, i0, i1, i2, i3);
       }
-      if (nAct < this.active) for (let c = 0; c < 2; c++) this.z[c].fill(0, nAct * 2, this.active * 2);
-      this.active = nAct;
-      const trail = p.trail * 0.01, d = p.drive * 0.01, dm = d * 3 > 1 ? 1 : d * 3, dg = 1 + 15 * d * d, dn = 0.5 / MOT_tanh(0.5 * dg);
-      this._k(L, n, 0, nAct, fr, trail, d, dm, dg, dn);
-      this._k(R, n, 1, nAct, fr, trail, d, dm, dg, dn);
+      g[0] = t0; g[1] = t1; g[2] = t2; g[3] = t3;
     }
-    // per-channel allpass chain: TDF-II 2nd-order allpasses, last stage cross-faded by the fractional AMOUNT
-    _k(buf, n, c, nAct, fr, trail, d, dm, dg, dn) {
-      const nFull = nAct - 1, z = this.z[c], co = this.c[c];
-      {
-        let fbv = this.fbS[c];
-        for (let i = 0; i < n; i++) {
-          let x = buf[i] + trail * MOT_tanh(fbv);
-          x += (MOT_tanh(x * dg) * dn - x) * dm; // drive (dm = 0 when off)
-          let y = x;
-          for (let j = 0; j < nFull; j++) {
-            const j2 = j * 2, c1 = co[j2], c2 = co[j2 + 1];
-            const o = c2 * y + z[j2];
-            z[j2] = c1 * (y - o) + z[j2 + 1];
-            z[j2 + 1] = y - c2 * o;
-            y = o;
-          }
-          if (nAct > 0) {
-            const j2 = nFull * 2, c1 = co[j2], c2 = co[j2 + 1];
-            const o = c2 * y + z[j2];
-            z[j2] = c1 * (y - o) + z[j2 + 1];
-            z[j2 + 1] = y - c2 * o;
-            y += (o - y) * fr;
-          }
-          fbv = y;
-          buf[i] = y;
+    // per-channel allpass chain: TDF-II 2nd-order allpasses; stage nb blended by the fractional AMOUNT
+    _k(buf, c, a, e, nb, fw, fI, g, off, i0, i1, i2, i3) {
+      const z = this.z[c], co = this.c[c];
+      let fbv = this.fbS[c], tr = g[0] + i0 * off, dm = g[1] + i1 * off, dg = g[2] + i2 * off, dn = g[3] + i3 * off;
+      const last = Math.min(nb, 31) * 2;
+      for (let i = a; i < e; i++) {
+        fw += fI; tr += i0; dm += i1; dg += i2; dn += i3;
+        let x = buf[i] + tr * MOT_tanh(fbv);
+        x += (MOT_tanh(x * dg) * dn - x) * dm; // drive (dm = 0 when off)
+        let y = x;
+        for (let j2 = 0; j2 < last; j2 += 2) {
+          const c1 = co[j2], c2 = co[j2 + 1];
+          const o = c2 * y + z[j2];
+          z[j2] = c1 * (y - o) + z[j2 + 1];
+          z[j2 + 1] = y - c2 * o;
+          y = o;
         }
-        this.fbS[c] = fbv;
+        const c1 = co[last], c2 = co[last + 1];
+        const o = c2 * y + z[last];
+        z[last] = c1 * (y - o) + z[last + 1];
+        z[last + 1] = y - c2 * o;
+        y += (o - y) * fw;
+        fbv = y;
+        buf[i] = y;
       }
+      this.fbS[c] = fbv;
     }
   });
 
@@ -1577,12 +1621,13 @@
       this.bq = new MOT_SVF();          // coefficient scratch
       this.hil = [new MOT_Hilbert(), new MOT_Hilbert()];
       // scalar state lives in a typed array (stable double representation for the JIT)
-      // 0 ssb cos, 1 ssb sin, 2 whistle cos, 3 whistle sin, 4 in-env, 5 agc-env, 6 agc gain, 7 agc gain (smoothed)
+      // 0 ssb cos, 1 ssb sin, 2 whistle cos, 3 whistle sin, 4 in-env, 5 agc-env, 6 drive bias (ramped), 7 agc gain (smoothed)
       // 8 gate, 9 open, 10 hold, 11 tail, 12 burst countdown, 13 burst left, 14 burst level, 15 burst env
       // 16 chop target, 17 chop, 18 chop countdown, 19 dropout countdown, 20 dropout left, 21 dropout gain
-      // 22..23 crackle L/R, 24..27 squelch-tail filters, 28 wobble phase, 29 band lo, 30 band hi
+      // 22..23 crackle L/R, 24..27 squelch-tail filters, 28 wobble phase, 29 band lo, 30 band hi, 31 drive gain (ramped)
       const S = this.S = new Float64Array(32);
-      S[0] = 1; S[2] = 1; S[6] = 1; S[7] = 1; S[12] = 0.4 * sr; S[19] = 0.9 * sr; S[21] = 1;
+      S[0] = 1; S[2] = 1; S[7] = 1; S[12] = 0.4 * sr; S[19] = 0.9 * sr; S[21] = 1;
+      this.dn0 = -1; this.c16 = 1 - Math.exp(-16 / (0.015 * sr));
       this.rs = 0x1f83d9ab; this.first = true;
       const K = this.K = new Float64Array(56); // per-block coefficients [0..31], sr constants [40..51]
       K[40] = 1 - Math.exp(-1 / (0.004 * sr)); K[41] = 1 - Math.exp(-1 / (0.012 * sr)); K[42] = 1 - Math.exp(-1 / (0.004 * sr));
@@ -1597,16 +1642,12 @@
       // ---- band edges (log-smoothed per block); 24 dB/oct each side, shared by L/R
       const fc = p.freq * Math.pow(2, dial * 0.5), bw = 0.6 + p.width * 0.044;
       const tlo = Math.log(clamp(fc * Math.pow(2, -bw / 2), 40, sr * 0.2)), thi = Math.log(clamp(fc * Math.pow(2, bw / 2), 400, sr * 0.45));
-      if (this.first) { S[29] = tlo; S[30] = thi; } else { S[29] += (tlo - S[29]) * 0.3; S[30] += (thi - S[30]) * 0.3; }
-      const gl = MOT_g(Math.exp(S[29]), sr), gh = MOT_g(Math.exp(S[30]), sr), bq = this.bq;
-      bq.coef(gl, 1 / 0.5412); const A0 = bq.a1, B0 = bq.a2, C0 = bq.a3, K0 = bq.k;
-      bq.coef(gl, 1 / 1.3066); const A1 = bq.a1, B1 = bq.a2, C1 = bq.a3, K1 = bq.k;
-      bq.coef(gh, 1 / 0.5412); const A2 = bq.a1, B2 = bq.a2, C2 = bq.a3;
-      bq.coef(gh, 1 / 1.3066); const A3 = bq.a1, B3 = bq.a2, C3 = bq.a3;
+      if (this.first) { S[29] = tlo; S[30] = thi; }
+      // band edges glide inside the kernel (coefficients every 16 samples); targets here
       // ---- amounts
       const nz = p.noise * 0.01, nl = Math.pow(nz, 1.5) * 0.08 * (1 + ad) * 3.0517578125e-5, crkP = nz * 30 / sr * 65536, crkA = 1.5e-5 * nz;
       const cx = p.comp * 0.01 * 0.8;
-      const drv = p.drive * 0.01, dg = 1 + drv * 10, bias = 0.15 * drv, tb = MOT_tanh(bias), dn = 0.6 / MOT_tanh(dg * 0.35);
+      const drv = p.drive * 0.01, dg = 1 + drv * 10, bias = 0.15 * drv, dn = 0.6 / MOT_tanh(dg * 0.35);
       const burst = p.burst * 0.01, bMean = burst > 0 ? (0.25 + 6 * (1 - burst) * (1 - burst)) * sr : 1e12;
       const drop = p.dropout * 0.01, dMean = drop > 0 ? (0.5 + 9 * (1 - drop) * (1 - drop)) * sr : 1e12;
       const sq = p.squelch * 0.01, thr = sq > 0 ? dbToGain(-72 + sq * 62) : -1, holdN = 0.22 * sr;
@@ -1620,9 +1661,11 @@
       let nrm = 1 / Math.hypot(S[0], S[1]); S[0] *= nrm; S[1] *= nrm;
       nrm = 1 / Math.hypot(S[2], S[3]); S[2] *= nrm; S[3] *= nrm;
       const K = this.K;
-      K[0] = A0; K[1] = B0; K[2] = C0; K[3] = K0; K[4] = A1; K[5] = B1; K[6] = C1; K[7] = K1;
-      K[8] = A2; K[9] = B2; K[10] = C2; K[11] = A3; K[12] = B3; K[13] = C3;
-      K[14] = nl; K[15] = crkP; K[16] = crkA; K[17] = cx; K[18] = dg; K[19] = bias; K[20] = tb; K[21] = dn;
+      K[0] = tlo; K[1] = thi;
+      if (S[31] === 0) { S[31] = dg; S[6] = bias; }
+      K[14] = nl; K[15] = crkP; K[16] = crkA; K[17] = cx; K[18] = dg; K[19] = bias; K[21] = dn;
+      if (this.dn0 < 0) this.dn0 = dn;
+      K[20] = this.dn0; this.dn0 = dn;
       K[22] = burst; K[23] = bMean; K[24] = dMean; K[25] = thr; K[26] = holdN;
       K[27] = Math.cos(sa); K[28] = Math.sin(sa); K[29] = Math.cos(wa); K[30] = Math.sin(wa); K[31] = 0.05 * ad;
       this._k(L, R, n);
@@ -1630,9 +1673,12 @@
     // per-sample kernel (kept separate and compact so the JIT tiers it up quickly)
     _k(L, R, n) {
       const K = this.K, S = this.S, sr = this.sr, hL = this.hil[0], hR = this.hil[1], bs = this.bs, STEP = 16;
-      const A0 = K[0], B0 = K[1], C0 = K[2], K0 = K[3], A1 = K[4], B1 = K[5], C1 = K[6], K1 = K[7];
-      const A2 = K[8], B2 = K[9], C2 = K[10], A3 = K[11], B3 = K[12], C3 = K[13];
-      const nl = K[14], crkP = K[15], crkA = K[16], cx = K[17], dg = K[18], bias = K[19], tb = K[20], dn = K[21];
+      const tlo = K[0], thi = K[1], c16 = this.c16, bq = this.bq;
+      let A0 = 0, B0 = 0, C0 = 0, K0 = 0, A1 = 0, B1 = 0, C1 = 0, K1 = 0, A2 = 0, B2 = 0, C2 = 0, A3 = 0, B3 = 0, C3 = 0;
+      const nl = K[14], crkP = K[15], crkA = K[16], cx = K[17];
+      // drive gain / bias / normaliser ramp across the block
+      let dg = S[31], bias = S[6], dn = K[20];
+      const dgI = (K[18] - dg) / n, bI = (K[19] - bias) / n, dnI = (K[21] - dn) / n;
       const burst = K[22], bMean = K[23], dMean = K[24], thr = K[25], holdN = K[26];
       const rc = K[27], rsn = K[28], wrc = K[29], wrs = K[30], wl = K[31];
       const gc = K[40], dc = K[41], bcf = K[42], cgc = K[43], tdec = K[44], tl = K[45], th = K[46], chopN = K[47], mk = 1.15;
@@ -1642,7 +1688,13 @@
       let ck0 = S[22], ck1 = S[23], t0 = S[24], t1 = S[25], t2 = S[26], t3 = S[27];
       for (let off = 0; off < n; off += STEP) {
         const e = Math.min(n, off + STEP);
-        // ---- control rate: squelch logic, random events, AGC gain
+        // ---- control rate: band edges, squelch logic, random events, AGC gain
+        S[29] += (tlo - S[29]) * c16; S[30] += (thi - S[30]) * c16;
+        const gl = MOT_g(Math.exp(S[29]), sr), gh = MOT_g(Math.exp(S[30]), sr);
+        bq.coef(gl, 1 / 0.5412); A0 = bq.a1; B0 = bq.a2; C0 = bq.a3; K0 = bq.k;
+        bq.coef(gl, 1 / 1.3066); A1 = bq.a1; B1 = bq.a2; C1 = bq.a3; K1 = bq.k;
+        bq.coef(gh, 1 / 0.5412); A2 = bq.a1; B2 = bq.a2; C2 = bq.a3;
+        bq.coef(gh, 1 / 1.3066); A3 = bq.a1; B3 = bq.a2; C3 = bq.a3;
         rs ^= rs << 13; rs ^= rs >>> 17; rs ^= rs << 5;
         const uA = (rs & 0xffff) * 1.52587890625e-5, uB = (rs >>> 16) * 1.52587890625e-5;
         const above = ei > thr * 1.4 ? 1 : 0, open0 = S[9];
@@ -1693,12 +1745,15 @@
           t = wc * wrc - ws * wrs; ws = ws * wrc + wc * wrs; wc = t;
           const wv = ws * wl * Math.min(1, ec * 6), gg = gate * mk;
           t0 += tl * (na * tn - t0); t1 += th * (t0 - t1); t2 += tl * (nb * tn - t2); t3 += th * (t2 - t3);
+          dg += dgI; bias += bI; dn += dnI;
+          const tb = MOT_tanh(bias);
           L[i] = ((MOT_tanh(dg * xl * cgs + bias) - tb) * dn + wv) * gg + t0 - t1;
           R[i] = ((MOT_tanh(dg * xr * cgs + bias) - tb) * dn + wv) * gg + t2 - t3;
         }
       }
       S[0] = oc; S[1] = os; S[2] = wc; S[3] = ws; S[4] = ei; S[5] = ec; S[7] = cgs; S[8] = gate; S[11] = tail;
       S[15] = bEnv; S[17] = chop; S[21] = dG; S[22] = ck0; S[23] = ck1; S[24] = t0; S[25] = t1; S[26] = t2; S[27] = t3;
+      S[31] = dg; S[6] = bias;
       this.rs = rs;
     }
   });
