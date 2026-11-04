@@ -62,6 +62,7 @@ async function bootAudio() {
   AUDIO.node.connect(analyser); analyser.connect(ctx.destination);
   AUDIO.started = true;
   sendAll();
+  post({ type: 'viz', on: currentPage === 'time' });
   await loadDemo(AUDIO.current || 'break', true);
   post({ type: 'srcmode', mode: AUDIO.srcMode || 0 });
   $('#engine-mode').textContent = AUDIO.mode === 'worklet' ? 'WORKLET' : 'SCRIPT';
@@ -237,7 +238,9 @@ async function togglePlay(force) {
 // waveform of the current source
 function drawWaveform(lp) {
   const cv = $('#src-wave'); if (!cv) return;
-  const c = cv.getContext('2d'), W = cv.width, H = cv.height;
+  const f = fit(cv); if (!f) return;
+  const { c, W, H } = f;
+  AUDIO.waveLoop = lp;
   c.clearRect(0, 0, W, H);
   c.fillStyle = cssVar('--fg-dim');
   const n = lp.L.length, step = n / W;

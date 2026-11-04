@@ -226,7 +226,8 @@ function frame(t) {
 }
 function drawOutput() {
   const cv = $('#scope'); if (!cv) return;
-  const c = cv.getContext('2d'), W = cv.width, H = cv.height;
+  const f = fit(cv); if (!f) return;
+  const { c, W, H } = f;
   c.clearRect(0, 0, W, H);
   if (AUDIO.analyser) {
     AUDIO.analyser.getByteFrequencyData(specBuf);
@@ -252,71 +253,178 @@ function drawOutput() {
   }
 }
 const vizState = { reel: 0 };
+// ---- engine visuals: drawn from real buffer envelopes sent by the engine (tick.viz)
+function vizText(c, txt, x, y, align, col) {
+  c.font = '600 10.5px ' + cssVar('--f-mono'); c.textAlign = align || 'left'; c.textBaseline = 'middle';
+  c.fillStyle = cssVar(col || '--fg-dim'); c.fillText(txt, x, y); c.textAlign = 'left';
+}
+function roundRect(c, x, y, w, hgt, r) {
+  r = Math.min(r, w / 2, hgt / 2);
+  c.beginPath(); c.moveTo(x + r, y); c.arcTo(x + w, y, x + w, y + hgt, r); c.arcTo(x + w, y + hgt, x, y + hgt, r);
+  c.arcTo(x, y + hgt, x, y, r); c.arcTo(x, y, x + w, y, r); c.closePath();
+}
+// Mirrored, smoothed waveform of an envelope (values 0..1, -1 = not recorded) between x0 and x1.
+// opts: { from, to } draw only that fraction range; gain scales height; fn(t) extra amplitude shaping; flip mirrors in time
+function waveShape(c, env, x0, x1, ym, hmax, opts = {}) {
+  const n = env.length, from = opts.from ?? 0, to = opts.to ?? 1, gain = opts.gain ?? 1;
+  const pts = [];
+  for (let i = 0; i < n; i++) {
+    const t = i / (n - 1); if (t < from - 1 / n || t > to + 1 / n) continue;
+    let v = env[opts.flip ? n - 1 - i : i]; if (v < 0) v = 0;
+    v = Math.pow(v, 0.7) * gain * (opts.fn ? opts.fn(t) : 1);
+    pts.push([x0 + (x1 - x0) * t, Math.max(0.6, v * hmax)]);
+  }
+  if (pts.length < 2) return;
+  c.beginPath();
+  c.moveTo(pts[0][0], ym - pts[0][1]);
+  for (let i = 1; i < pts.length; i++) { const p0 = pts[i - 1], p1 = pts[i]; const mx = (p0[0] + p1[0]) / 2; c.quadraticCurveTo(p0[0], ym - p0[1], mx, ym - (p0[1] + p1[1]) / 2); }
+  c.lineTo(pts[pts.length - 1][0], ym - pts[pts.length - 1][1]);
+  for (let i = pts.length - 1; i >= 0; i--) { const p = pts[i]; c.lineTo(p[0], ym + p[1]); }
+  c.closePath();
+  c.fillStyle = opts.fill; c.fill();
+}
+function headLine(c, x, y0, y1, col) {
+  c.save();
+  c.shadowColor = cssVar(col); c.shadowBlur = 8;
+  c.strokeStyle = cssVar(col); c.lineWidth = 2; c.lineCap = 'round';
+  c.beginPath(); c.moveTo(x, y0); c.lineTo(x, y1); c.stroke();
+  c.restore();
+  c.fillStyle = cssVar(col);
+  c.beginPath(); c.moveTo(x - 4, y0 - 4); c.lineTo(x + 4, y0 - 4); c.lineTo(x, y0 + 1); c.closePath(); c.fill();
+}
+function idleLine(c, x0, x1, ym) {
+  c.strokeStyle = cssVar('--line-2'); c.setLineDash([2, 4]); c.lineWidth = 1;
+  c.beginPath(); c.moveTo(x0, ym); c.lineTo(x1, ym); c.stroke(); c.setLineDash([]);
+}
+
+function drawStretchViz(cv, tk) {
+  const f = fit(cv); if (!f) return; const { c, W, H } = f; c.clearRect(0, 0, W, H);
+  const on = P['stretch.on'] >= 0.5, fr = P['stretch.freeze'] >= 0.5, rev = P['stretch.rev'] >= 0.5;
+  const v = tk && tk.viz && tk.viz.sh;
+  const sp = tk && tk.sh && on ? tk.sh.speed : getV('stretch.speed') / 100;
+  vizText(c, (fr ? 'FROZEN LOOP' : 'CAPTURE ' + fmt('stretch.tempo')) + (rev ? '  ◀ REV' : ''), 10, 11, 'left', fr ? '--mod' : '--fg-dim');
+  vizText(c, 'SPEED ' + Math.round(sp * 100) + '%', W - 10, 11, 'right');
+  const x0 = 10, x1 = W - 10, top = 22, bot = H - 6, ym = (top + bot) / 2, hm = (bot - top) / 2 - 1;
+  roundRect(c, x0 - 4, top - 2, x1 - x0 + 8, bot - top + 4, 5); c.fillStyle = cssVar(fr ? '--mod-fill' : '--panel-2'); c.fill();
+  if (!v || !on) { idleLine(c, x0, x1, ym); return; }
+  c.save(); if (fr) c.globalAlpha = 0.55;
+  waveShape(c, v.env, x0, x1, ym, hm, { fill: cssVar(fr ? '--mod' : '--fg-faint'), to: Math.min(1, v.rec) });
+  c.restore();
+  // grains: translucent windows over the stretch of audio each one is reading
+  for (const [gx, w, dir, span] of v.grains) {
+    const a = Math.max(0, Math.min(1, dir > 0 ? gx : gx - span)), b = Math.max(0, Math.min(1, dir > 0 ? gx + span : gx));
+    if (b <= a) continue;
+    c.save(); c.globalAlpha = 0.25 + 0.6 * w;
+    waveShape(c, v.env, x0, x1, ym, hm, { from: a, to: b, fill: cssVar('--accent'), fn: (t) => 0.35 + 0.65 * Math.sin(Math.PI * Math.max(0, Math.min(1, (t - a) / (b - a)))) });
+    c.restore();
+    const gxp = x0 + (x1 - x0) * Math.max(0, Math.min(1, gx));
+    c.fillStyle = cssVar('--accent'); c.globalAlpha = 0.4 + 0.6 * w; c.beginPath(); c.arc(gxp, ym, 1.8 + 1.6 * w, 0, Math.PI * 2); c.fill(); c.globalAlpha = 1;
+  }
+  headLine(c, x0 + (x1 - x0) * Math.max(0, Math.min(1, v.head)), top, bot, '--accent');
+}
+
+function drawVariViz(cv, tk, dt) {
+  const f = fit(cv); if (!f) return; const { c, W, H } = f; c.clearRect(0, 0, W, H);
+  const on = P['vari.on'] >= 0.5, v = tk && tk.viz && tk.viz.vr;
+  const rate = on && v ? v.rate : on ? 0 : 1;
+  if (live.playing) vizState.reel += dt * 3.2 * rate;
+  const R = Math.min(H / 2 - 4, 30), cy = H / 2, cxL = R + 8, cxR = W - R - 8;
+  const reel = (cx, pack, ang) => {
+    // flange
+    c.beginPath(); c.arc(cx, cy, R, 0, Math.PI * 2); c.fillStyle = cssVar('--panel-2'); c.fill();
+    c.lineWidth = 1.2; c.strokeStyle = cssVar('--line-2'); c.stroke();
+    // tape pack
+    const grd = c.createRadialGradient(cx, cy, R * 0.25, cx, cy, R * pack);
+    grd.addColorStop(0, '#3a2a1c'); grd.addColorStop(1, '#5a3f27');
+    c.beginPath(); c.arc(cx, cy, R * pack, 0, Math.PI * 2); c.fillStyle = grd; c.fill();
+    for (let k = 1; k < 4; k++) { c.beginPath(); c.arc(cx, cy, R * (0.3 + (pack - 0.3) * k / 4), 0, Math.PI * 2); c.strokeStyle = 'rgba(0,0,0,0.18)'; c.lineWidth = 1; c.stroke(); }
+    // hub with three windows, turning
+    c.beginPath(); c.arc(cx, cy, R * 0.3, 0, Math.PI * 2); c.fillStyle = cssVar('--fg-dim'); c.fill();
+    for (let k = 0; k < 3; k++) {
+      const an = ang + k * 2.0944;
+      c.beginPath(); c.arc(cx, cy, R * 0.24, an, an + 0.9); c.arc(cx, cy, R * 0.12, an + 0.9, an, true); c.closePath(); c.fillStyle = cssVar('--bg'); c.fill();
+    }
+    c.beginPath(); c.arc(cx, cy, 2.2, 0, Math.PI * 2); c.fillStyle = cssVar('--bg'); c.fill();
+  };
+  reel(cxL, 0.86, vizState.reel); reel(cxR, 0.62, vizState.reel * 1.38);
+  // tape window between the reels: last two seconds of input, newest at the right (record head)
+  const x0 = cxL + R + 10, x1 = cxR - R - 10, top = 8, bot = H - 8, ym = (top + bot) / 2 + 4, hm = (bot - top) / 2 - 6;
+  if (x1 - x0 < 40) return;
+  roundRect(c, x0, top, x1 - x0, bot - top, 4); c.fillStyle = cssVar('--bg'); c.fill(); c.strokeStyle = cssVar('--line'); c.lineWidth = 1; c.stroke();
+  // tape lines from the reels into the window
+  c.strokeStyle = '#5a3f27'; c.lineWidth = 2;
+  c.beginPath(); c.moveTo(cxL, cy + R * 0.86); c.lineTo(x0, bot - 2); c.moveTo(cxR, cy + R * 0.62); c.lineTo(x1, bot - 2); c.stroke();
+  const rateTxt = !on ? 'BYPASS' : P['vari.stop'] >= 0.5 && Math.abs(rate) < 0.02 ? 'STOPPED' : (rate < 0 ? '◀ ×' : '×') + Math.abs(rate).toFixed(2);
+  vizText(c, rateTxt, (x0 + x1) / 2, top + 9, 'center', rate < 0 ? '--warn' : on ? '--fg' : '--fg-dim');
+  if (!v || !on) { idleLine(c, x0 + 8, x1 - 8, ym); return; }
+  const ix0 = x0 + 6, ix1 = x1 - 6, hx = ix0 + (ix1 - ix0) * Math.max(0, Math.min(1, v.head));
+  // lag between play head and record head
+  c.fillStyle = cssVar('--accent-fill'); c.fillRect(Math.min(hx, ix1), top + 18, Math.abs(ix1 - hx), bot - top - 22);
+  waveShape(c, v.env, ix0, ix1, ym, hm - 6, { fill: cssVar('--fg-faint') });
+  c.save(); c.beginPath(); c.rect(Math.min(hx, ix1), top, Math.abs(ix1 - hx), bot - top); c.clip();
+  waveShape(c, v.env, ix0, ix1, ym, hm - 6, { fill: cssVar('--fg-dim') }); c.restore();
+  headLine(c, hx, top + 18, bot - 4, '--accent');
+  c.fillStyle = cssVar('--warn'); c.beginPath(); c.arc(ix1, top + 20, 2.6, 0, Math.PI * 2); c.fill();
+}
+
+function drawStutterViz(cv, tk) {
+  const f = fit(cv); if (!f) return; const { c, W, H } = f; c.clearRect(0, 0, W, H);
+  const st = tk && tk.st, v = tk && tk.viz && tk.viz.st, on = P['stutter.on'] >= 0.5;
+  const x0 = 10, x1 = W - 10, top = 22, bot = H - 6;
+  if (P['stutter.bend'] >= 0.5) {
+    const wz = DSP.WARP_ZONES[DSP.zoneOf(DSP.WARP_ZONES, P['bend.warp'])][2], bz = DSP.BREAK_ZONES[DSP.zoneOf(DSP.BREAK_ZONES, P['bend.brk'])][2];
+    vizText(c, 'WARP ' + wz + (st && st.scratch ? ' · ' + st.scratch : ''), 10, 11, 'left', wz === 'OFF' ? '--fg-dim' : '--c-glitch');
+    vizText(c, 'BREAK ' + bz, W - 10, 11, 'right', bz === 'OFF' ? '--fg-dim' : '--c-glitch');
+    const reps = st && st.bend ? st.reps : Math.round(getV('bend.reps')), bw = (x1 - x0) / reps;
+    for (let i = 0; i < reps; i++) {
+      const cur = st && st.bend && i === st.j && on;
+      roundRect(c, x0 + i * bw + 1, top, bw - 2, bot - top, 3);
+      c.fillStyle = cssVar(cur ? '--accent-fill' : '--panel-2'); c.fill();
+      if (cur) { c.strokeStyle = cssVar('--accent'); c.lineWidth = 1.2; c.stroke(); }
+    }
+    const ym = (top + bot) / 2, hm = (bot - top) / 2 - 3;
+    if (!v || !on) { idleLine(c, x0, x1, ym); return; }
+    waveShape(c, v.env, x0, x1, ym, hm, { fill: cssVar(v.live ? '--warn' : '--fg-dim') });
+    if (st && st.bend) {
+      const j = st.j, a = j / reps, b = (j + 1) / reps;
+      c.save(); c.beginPath(); c.rect(x0 + a * (x1 - x0), top, (b - a) * (x1 - x0), bot - top); c.clip();
+      waveShape(c, v.env, x0, x1, ym, hm, { fill: cssVar('--accent') }); c.restore();
+    }
+    let hx = v.head - Math.floor(v.head);
+    headLine(c, x0 + (x1 - x0) * hx, top, bot, '--fg');
+    if (v.live) vizText(c, 'RECORDING LOOP', (x0 + x1) / 2, (top + bot) / 2, 'center', '--fg');
+    return;
+  }
+  // STUTTER: one tile per repeat of the captured slice, shaped by decay, gate and reverse
+  const link = P['stutter.link'] >= 0.5;
+  let rateB, capB;
+  if (link) { const lp = DSP.LINK_PRESETS[Math.round(getV('stutter.lpreset'))] || DSP.LINK_PRESETS[4]; rateB = DSP.DIV_BEATS[lp[0]]; capB = DSP.DIV_BEATS[lp[1]]; }
+  else { capB = getV('stutter.capture'); rateB = P['stutter.sync'] >= 0.5 ? getV('stutter.rate') : getV('stutter.rate_ms') / 1000 * S.bpm / 60; }
+  const n = Math.max(1, Math.min(16, Math.round(capB / rateB)));
+  const act = !!(st && st.active && on), k = st ? st.k : 0;
+  vizText(c, act ? `REPEAT ${k + 1}` + (n > 1 ? ` / ${n}` : '') : on ? 'DRY' : 'OFF', 10, 11, 'left', act ? '--accent' : '--fg-dim');
+  vizText(c, (link ? fmt('stutter.lpreset') : (P['stutter.sync'] >= 0.5 ? fmt('stutter.rate') : fmt('stutter.rate_ms')) + ' / ' + fmt('stutter.capture')), W - 10, 11, 'right');
+  const bw = (x1 - x0) / n, ym = (top + bot) / 2, hm = (bot - top) / 2 - 3;
+  const decay = getV('stutter.decay') / 100, gate = getV('stutter.gate') / 100, rev = P['stutter.rev'] >= 0.5;
+  const gateFn = (t) => { if (gate <= 0.001) return 1; const open = 1 - 0.92 * gate; return t < open ? 1 : Math.max(0, 1 - (t - open) / (1 - open)); };
+  for (let i = 0; i < n; i++) {
+    const tx0 = x0 + i * bw + 1.5, tx1 = x0 + (i + 1) * bw - 1.5;
+    const cur = act && i === Math.min(k, n - 1), done = act && i < k;
+    roundRect(c, tx0, top, tx1 - tx0, bot - top, 3); c.fillStyle = cssVar(cur ? '--accent-fill' : '--panel-2'); c.fill();
+    if (cur) { c.strokeStyle = cssVar('--accent'); c.lineWidth = 1.2; c.stroke(); }
+    const g = i === 0 ? 1 : Math.pow(1 - decay * 0.82, i);
+    if (v && act) waveShape(c, v.env, tx0 + 2, tx1 - 2, ym, hm, { gain: g, fn: gateFn, flip: rev && i > 0, fill: cssVar(cur ? '--accent' : done ? '--fg-dim' : '--fg-faint') });
+    else idleLine(c, tx0 + 3, tx1 - 3, ym);
+    if (cur && st) headLine(c, tx0 + 2 + (tx1 - tx0 - 4) * Math.max(0, Math.min(1, st.ph)), top, bot, '--fg');
+  }
+}
+
 function drawEngines(dt) {
   const tk = live.tick;
-  // STRETCH: captured chunk with read head
-  let cv = $('#viz-stretch');
-  if (cv) {
-    const c = cv.getContext('2d'), W = cv.width, H = cv.height; c.clearRect(0, 0, W, H);
-    const on = P['stretch.on'] >= 0.5, fr = P['stretch.freeze'] >= 0.5;
-    c.fillStyle = cssVar(fr ? '--mod-fill' : '--panel-2'); c.fillRect(8, 18, W - 16, H - 36);
-    c.strokeStyle = cssVar('--line'); c.strokeRect(8.5, 18.5, W - 17, H - 37);
-    const rev = P['stretch.rev'] >= 0.5;
-    const raw = tk && tk.sh ? tk.sh.pos : 0, pos = rev ? 1 - raw : raw; // REVERSE reads right → left
-    const grains = 10, dir = rev ? -1 : 1; c.fillStyle = cssVar('--fg-dim');
-    for (let g = 0; g < grains; g++) { const x = 8 + (pos * (W - 16)) - dir * g * 6; if (x < 8 || x > W - 8) break; c.globalAlpha = 1 - g / grains; c.fillRect(x - 1, 22 + (g % 3) * 8, 3, H - 52); }
-    c.globalAlpha = 1;
-    c.fillStyle = cssVar(on ? '--accent' : '--fg-dim'); c.fillRect(8 + pos * (W - 16) - 1, 12, 2.5, H - 24);
-    c.font = '600 11px ' + cssVar('--f-mono'); c.fillStyle = cssVar('--fg-dim');
-    c.fillText((fr ? 'FROZEN' : 'CAPTURE ' + fmt('stretch.tempo')) + (rev ? '  ◀ REVERSE' : ''), 10, 12);
-    const sp = tk && tk.sh && on ? tk.sh.speed : getV('stretch.speed') / 100;
-    c.textAlign = 'right'; c.fillText('SPEED ' + Math.round(sp * 100) + '%', W - 10, 12); c.textAlign = 'left';
-  }
-  // VARISPEED: two reels turning at the head rate
-  cv = $('#viz-vari');
-  if (cv) {
-    const c = cv.getContext('2d'), W = cv.width, H = cv.height; c.clearRect(0, 0, W, H);
-    const rate = tk && P['vari.on'] >= 0.5 ? tk.vr : (P['vari.on'] >= 0.5 ? 0 : 1);
-    if (live.playing) vizState.reel += dt * 4 * rate;
-    const reel = (cx, r, a) => {
-      c.strokeStyle = cssVar('--fg-dim'); c.lineWidth = 1.5; c.beginPath(); c.arc(cx, H / 2, r, 0, Math.PI * 2); c.stroke();
-      c.fillStyle = cssVar('--panel-2'); c.beginPath(); c.arc(cx, H / 2, r * 0.82, 0, Math.PI * 2); c.fill();
-      for (let k = 0; k < 3; k++) { const an = a + k * 2.094; c.fillStyle = cssVar('--bg'); c.beginPath(); c.moveTo(cx, H / 2); c.arc(cx, H / 2, r * 0.7, an, an + 0.8); c.closePath(); c.fill(); }
-      c.fillStyle = cssVar('--fg-dim'); c.beginPath(); c.arc(cx, H / 2, 4, 0, Math.PI * 2); c.fill();
-    };
-    reel(W * 0.3, H * 0.4, vizState.reel); reel(W * 0.7, H * 0.4, vizState.reel * 1.1);
-    c.strokeStyle = cssVar('--accent'); c.lineWidth = 2; c.beginPath(); c.moveTo(W * 0.3, H / 2 + H * 0.4); c.lineTo(W * 0.7, H / 2 + H * 0.4); c.stroke();
-    c.font = '600 11px ' + cssVar('--f-mono'); c.fillStyle = cssVar(rate < 0 ? '--warn' : '--fg-dim'); c.textAlign = 'center';
-    c.fillText((rate < 0 ? 'REV ×' : '×') + Math.abs(rate).toFixed(2), W / 2, H / 2 + 4); c.textAlign = 'left';
-  }
-  // STUTTER / BENDIT
-  cv = $('#viz-stutter');
-  if (cv) {
-    const c = cv.getContext('2d'), W = cv.width, H = cv.height; c.clearRect(0, 0, W, H);
-    const st = tk && tk.st; c.font = '600 11px ' + cssVar('--f-mono');
-    if (P['stutter.bend'] >= 0.5) {
-      const reps = st && st.bend ? st.reps : Math.round(getV('bend.reps'));
-      const bw = (W - 16) / reps;
-      for (let i = 0; i < reps; i++) { c.fillStyle = cssVar(st && st.bend && i === st.j ? '--accent' : '--panel-2'); c.fillRect(8 + i * bw + 1, 22, bw - 2, H - 34); }
-      if (st && st.bend) { c.fillStyle = cssVar('--fg'); c.fillRect(8 + st.ph * (W - 16), 18, 2, H - 26); }
-      c.fillStyle = cssVar('--fg-dim');
-      const wz = DSP.WARP_ZONES[DSP.zoneOf(DSP.WARP_ZONES, P['bend.warp'])][2], bz = DSP.BREAK_ZONES[DSP.zoneOf(DSP.BREAK_ZONES, P['bend.brk'])][2];
-      c.fillText('WARP ' + wz + (st && st.scratch ? ' · ' + st.scratch : ''), 10, 13); c.textAlign = 'right'; c.fillText('BREAK ' + bz, W - 10, 13); c.textAlign = 'left';
-    } else {
-      const n = 8, bw = (W - 16) / n, k = st ? st.k : 0, act = st && st.active;
-      for (let i = 0; i < n; i++) {
-        const cur = act && i === Math.min(k, n - 1);
-        const decay = Math.pow(1 - getV('stutter.decay') / 100 * 0.82, i);
-        const hh = (H - 34) * (i === 0 ? 1 : decay);
-        c.fillStyle = cssVar(cur ? '--accent' : i <= k && act ? '--fg-dim' : '--panel-2');
-        c.fillRect(8 + i * bw + 1, H - 12 - hh, bw - 2, hh);
-        if (cur) { c.fillStyle = cssVar('--fg'); c.fillRect(8 + i * bw + 1 + (bw - 2) * st.ph, H - 12 - hh, 2, hh); }
-      }
-      c.fillStyle = cssVar('--fg-dim');
-      c.fillText(act ? 'REPEAT ' + (k + 1) : 'DRY', 10, 13);
-      c.textAlign = 'right'; c.fillText((P['stutter.link'] >= 0.5 ? fmt('stutter.lpreset') : (P['stutter.sync'] >= 0.5 ? fmt('stutter.rate') : fmt('stutter.rate_ms')) + ' / ' + fmt('stutter.capture')), W - 10, 13); c.textAlign = 'left';
-    }
-  }
+  const a = $('#viz-stretch'), b = $('#viz-vari'), d = $('#viz-stutter');
+  if (a) drawStretchViz(a, tk);
+  if (b) drawVariViz(b, tk, dt);
+  if (d) drawStutterViz(d, tk);
 }
 on('tick', (t) => {
   // live values on modulated knobs
@@ -343,6 +451,7 @@ function boot() {
   showPage(['time', 'fx', 'animate', 'perform'].includes(page) ? page : 'time');
   // preview the loop PLAY will start (loadPreset already did if the preset names one)
   if (!AUDIO.current) { AUDIO.current = 'break'; previewDemo('break'); }
+  window.addEventListener('resize', () => { if (AUDIO.waveLoop) drawWaveform(AUDIO.waveLoop); });
   requestAnimationFrame(frame);
 }
 document.readyState === 'loading' ? document.addEventListener('DOMContentLoaded', boot) : boot();

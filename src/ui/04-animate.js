@@ -32,7 +32,8 @@ const scopes = [];
 function drawScopes() {
   for (const sc of scopes) {
     if (!sc.cv.isConnected || sc.cv.offsetParent === null) continue;
-    const c = sc.cv.getContext('2d'), W = sc.cv.width, H = sc.cv.height, hist = srcHist[sc.srcIdx];
+    const f = fit(sc.cv); if (!f) continue;
+    const { c, W, H } = f, hist = srcHist[sc.srcIdx];
     c.clearRect(0, 0, W, H);
     c.strokeStyle = cssVar('--line'); c.lineWidth = 1;
     c.beginPath(); c.moveTo(0, H / 2 + 0.5); c.lineTo(W, H / 2 + 0.5); c.stroke();
@@ -127,7 +128,8 @@ function drawGraphs() {
   const t = live.tick;
   for (const ed of graphEditors) {
     const cv = ed.cv; if (!cv.isConnected || cv.offsetParent === null) continue;
-    const c = cv.getContext('2d'), W = cv.width, H = cv.height, pts = S.graphs[ed.g];
+    const f = fit(cv); if (!f) continue;
+    const { c, W, H } = f, pts = S.graphs[ed.g];
     c.clearRect(0, 0, W, H);
     c.strokeStyle = cssVar('--line'); c.lineWidth = 1;
     for (let k = 1; k < 8; k++) { const x = Math.round(k / 8 * W) + 0.5; c.beginPath(); c.moveTo(x, 0); c.lineTo(x, H); c.stroke(); }
@@ -253,7 +255,8 @@ function buildPerform(root) {
   onKey('perform.x', padText); onKey('perform.y', padText);
   padDraw = () => {
     if (!cv.isConnected || cv.offsetParent === null) return;
-    const c = cv.getContext('2d'), W = cv.width, H = cv.height;
+    const f = fit(cv); if (!f) return;
+    const { c, W, H } = f;
     c.clearRect(0, 0, W, H);
     c.strokeStyle = cssVar('--line'); c.lineWidth = 1;
     for (let k = 1; k < 8; k++) { const q = Math.round(k / 8 * W) + 0.5; c.beginPath(); c.moveTo(q, 0); c.lineTo(q, H); c.moveTo(0, q); c.lineTo(W, q); c.stroke(); }

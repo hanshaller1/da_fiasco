@@ -457,7 +457,8 @@ function SlotRow(slot, opts = {}) {
   del.addEventListener('click', () => removeSlot(slot));
   const cv = h('canvas', { class: 'slot-curve', width: 72, height: 30, 'aria-hidden': 'true' });
   const draw = () => {
-    const c = cv.getContext('2d'), W = cv.width, H = cv.height;
+    const f = fit(cv); if (!f) { requestAnimationFrame(draw); return; }
+    const { c, W, H } = f;
     c.clearRect(0, 0, W, H);
     c.strokeStyle = cssVar('--line'); c.lineWidth = 1; c.strokeRect(0.5, 0.5, W - 1, H - 1);
     c.strokeStyle = cssVar(opts.color || '--mod'); c.lineWidth = 1.6; c.beginPath();
@@ -503,6 +504,17 @@ function revealParam(key) {
   if (set) for (const w of set) if (w.el.isConnected) { w.el.scrollIntoView({ block: 'center', behavior: 'smooth' }); w.el.classList.add('flash'); setTimeout(() => w.el.classList.remove('flash'), 900); break; }
 }
 
+// Size a canvas to its CSS box at the display's pixel density and draw in CSS pixels,
+// so every visual stays sharp (Retina included) at any panel width.
+function fit(cv) {
+  const w = cv.clientWidth, hh = cv.clientHeight;
+  if (!w || !hh) return null;
+  const dpr = Math.min(3, window.devicePixelRatio || 1), W = Math.round(w * dpr), H = Math.round(hh * dpr);
+  if (cv.width !== W || cv.height !== H) { cv.width = W; cv.height = H; }
+  const c = cv.getContext('2d');
+  c.setTransform(dpr, 0, 0, dpr, 0, 0);
+  return { c, W: w, H: hh };
+}
 const cssCache = {};
 function cssVar(name) { if (!(name in cssCache)) cssCache[name] = getComputedStyle(document.documentElement).getPropertyValue(name).trim() || '#888'; return cssCache[name]; }
 
@@ -514,5 +526,6 @@ function showPage(p) {
   for (const b of $$('.tab')) { const on = b.dataset.page === p; b.classList.toggle('on', on); b.setAttribute('aria-selected', on ? 'true' : 'false'); }
   for (const el of $$('.page')) el.hidden = el.id !== 'page-' + p;
   if (pageHooks[p]) pageHooks[p]();
+  post({ type: 'viz', on: p === 'time' });
   try { localStorage.setItem('debacle.page', p); } catch (e) { /* storage unavailable */ }
 }

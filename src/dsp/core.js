@@ -150,6 +150,7 @@ class DebacleEngine {
       case 'bpm': this.setBpm(m.bpm); break;
       case 'play': this.setPlay(m.on); break;
       case 'print': this.startPrint(m.len); break;
+      case 'viz': this.vizOn = !!m.on; break;
       case 'resetfx': { const s = this.fx[m.id]; if (s && s.inst) s.inst.reset(); break; }
     }
   }
@@ -657,6 +658,44 @@ class DebacleEngine {
     a.z1 = az1; a.z2 = az2; b.z1 = bz1; b.z2 = bz2; c.z1 = cz1; c.z2 = cz2;
   }
 
+  // Peak envelope of a stretch of an engine ring buffer: `bins` values 0..1, or -1 where the
+  // region lies in the future (not recorded yet). Strided reads keep this cheap (~3k reads).
+  static env(ring, start, len, bins) {
+    const out = new Array(bins), L = ring.L, R = ring.R, m = ring.mask, w = ring.w - 1;
+    start = Math.floor(start); len = Math.max(bins, Math.floor(len));
+    for (let b = 0; b < bins; b++) {
+      const a = start + Math.floor(b * len / bins), e = start + Math.floor((b + 1) * len / bins);
+      if (a > w) { out[b] = -1; continue; }
+      const stop = Math.min(e, w + 1), step = Math.max(1, Math.floor((stop - a) / 48));
+      let pk = 0;
+      for (let i = a; i < stop; i += step) { const j = i & m, v = Math.max(Math.abs(L[j]), Math.abs(R[j])); if (v > pk) pk = v; }
+      out[b] = Math.round(Math.min(1, pk) * 1000) / 1000;
+    }
+    return out;
+  }
+  vizInfo() {
+    const v = {}, B = 96;
+    const sh = this.stretch;
+    if (sh.fader.v > 0 && sh.chunkLen) {
+      const rev = this.banks.stretch.v.rev >= 0.5, fz = sh.frozenLoop || 0, len = fz || sh.chunkLen;
+      const start = rev && !fz ? sh.chunkStart - len : sh.chunkStart;
+      const grains = [];
+      for (const g of sh.grains) if (g.on) grains.push([(g.pos - start) / len, hann(g.t / g.dur), g.rate < 0 ? -1 : 1, (g.dur - g.t) * Math.abs(g.rate) / len]);
+      const head = rev ? ((fz ? sh.chunkStart + fz : sh.chunkStart) - sh.readPos - start) / len : (sh.chunkStart + sh.readPos - start) / len;
+      v.sh = { env: DebacleEngine.env(sh.ring, start, len, B), rec: Math.min(1, (sh.ring.w - start) / len), grains, frozen: fz > 0, rev, head };
+    }
+    const vr = this.vari;
+    if (vr.fader.v > 0) {
+      const span = Math.round(this.sr * 2), start = vr.ring.w - span;
+      v.vr = { env: DebacleEngine.env(vr.ring, start, span, B), head: (vr.headA - start) / span, rate: vr.readRate };
+    }
+    const st = this.stutter;
+    if (st.fader.v > 0) {
+      if (st.state.bend) { const b = st.b; v.st = { env: DebacleEngine.env(st.ring, b.capStart, b.T, B), head: (st.va.pos - b.capStart) / (b.T || 1), live: st.ring.w - 1 < b.liveUntil }; }
+      else v.st = { env: DebacleEngine.env(st.ring, st.sliceStart, st.sliceLen, B), head: (st.va.pos - st.sliceStart) / (st.sliceLen || 1) };
+    }
+    return v;
+  }
   sendTick(latency) {
     const mods = {};
     for (const t of this.targets) mods[t.key] = t.bank.eff[t.i];
@@ -668,6 +707,7 @@ class DebacleEngine {
       st: Object.assign({}, this.stutter.state), sh: Object.assign({}, this.stretch.state), vr: this.vari.readRate,
       srcPos: this.src ? this.srcPos / this.src.len : 0, fx: fxl,
       engines: [this.stretch.fader.v, this.vari.fader.v, this.stutter.fader.v],
+      viz: this.vizOn ? this.vizInfo() : null,
     });
     this.peaks.fill(0); this.gr = 0;
   }

@@ -177,7 +177,7 @@ body.playing .play .ic-play { display: none; }
 .routing { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 12px; }
 .routing .lbl { font: 600 10.5px var(--f-mono); color: var(--fg-dim); letter-spacing: 0.08em; }
 .engines { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; align-items: start; }
-.viz { width: 100%; height: 70px; background: var(--bg); border: 1px solid var(--line); border-radius: var(--r); display: block; }
+.viz { width: 100%; height: 86px; background: var(--bg); border: 1px solid var(--line); border-radius: var(--r); display: block; }
 .hero-row { display: flex; gap: 10px; align-items: flex-start; }
 .hero-row > .kgrid { flex: 1; min-width: 0; }
 .hero-stack { display: flex; flex-direction: column; align-items: center; gap: 2px; }
